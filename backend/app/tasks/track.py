@@ -10,6 +10,7 @@ from app.db.database import SessionLocal
 from app.db.models import Match, MatchStatus, Player, Detection
 from app.cv.detector import YOLOv8Detector
 from app.cv.tracker import CentroidTracker
+from app.cv.pitch_mask import PitchMask
 from app.tasks.ingest import download_match_video
 from app.config import settings
 
@@ -34,6 +35,7 @@ def track_players_task(self, match_id: str, s3_url: str = None) -> Dict[str, Any
         db.commit()
 
         video_url = s3_url or match.video_s3_url or "synthetic"
+        is_synthetic_source = video_url == "synthetic" or video_url.startswith("mock://")
         local_video_path = os.path.join(settings.STORAGE_LOCAL_DIR, f"{match_id}.mp4")
 
         # 1. Download/prepare video
@@ -53,14 +55,19 @@ def track_players_task(self, match_id: str, s3_url: str = None) -> Dict[str, Any
             model_path=settings.YOLO_MODEL_PATH,
             conf_threshold=settings.CONFIDENCE_THRESHOLD,
             iou_threshold=settings.IOU_THRESHOLD,
+            allow_fallback_on_empty=is_synthetic_source,
+            img_size=settings.YOLO_IMG_SIZE,
         )
-        tracker = CentroidTracker(max_lost_frames=30, max_distance_px=90.0)
+        tracker = CentroidTracker(max_lost_frames=45, max_distance_px=90.0)
 
         frame_no = 0
         all_detections_batch: List[Detection] = []
         sampled_rate = 2  # Process every 2nd frame for speed/efficiency while maintaining tracks
+        pitch_mask: PitchMask = None  # Computed lazily from the first frame (camera is fixed all match)
 
-        logger.info(f"Processing {total_frames} frames for match_id={match_id} (fps={fps}, res={width}x{height})...")
+        max_limit = int(os.getenv("MAX_FRAMES", "0"))
+        effective_total = min(total_frames, max_limit) if max_limit > 0 else total_frames
+        logger.info(f"Processing {effective_total} frames for match_id={match_id} (fps={fps}, res={width}x{height}, GPU={detector.device})...")
 
         while True:
             ret, frame = cap.read()
@@ -68,16 +75,44 @@ def track_players_task(self, match_id: str, s3_url: str = None) -> Dict[str, Any
                 break
 
             frame_no += 1
-            if frame_no % sampled_rate != 0 and frame_no != total_frames:
+            if max_limit > 0 and frame_no > max_limit:
+                break
+
+            if frame_no % sampled_rate != 0 and frame_no != effective_total:
                 continue
 
+            if frame_no % 300 == 0 or frame_no == effective_total:
+                pct = (frame_no / effective_total) * 100
+                logger.info(f"CV Tracking Progress: Frame {frame_no}/{effective_total} ({pct:.1f}%) | Active Player Tracks: {len([t for t in tracker.tracks.values() if t.class_name == 'player'])}")
+
             timestamp_ms = int((frame_no / fps) * 1000)
+
+            if pitch_mask is None or pitch_mask.mask is None:
+                # Keep retrying (e.g. past intro/title cards) until segmentation succeeds, then lock it in
+                pitch_mask = PitchMask(frame)
 
             # Detect objects (players and ball)
             detections = detector.detect_frame(frame)
 
-            # Update tracker
-            active_tracks = tracker.update(detections, frame_no)
+            # Drop "player" detections that fall outside the field of play - sideline
+            # spectators, benches, and bystanders are detected by YOLO just as readily
+            # as players, and otherwise fragment/inflate track IDs.
+            detections = [
+                d for d in detections
+                if d.class_name != "player" or pitch_mask.contains_point((d.bbox[0] + d.bbox[2]) / 2.0, d.bbox[3])
+            ]
+
+            # A single full-frame pass essentially never finds the ball on real broadcast-
+            # distance footage - it's too small/low-contrast. Tiled ball-only detection
+            # trades extra inference passes for enough effective resolution to see it.
+            # Skip this on the synthetic demo canvas: the fallback already places a
+            # simulated ball there, and there's no real ball to tile-search for.
+            if not is_synthetic_source:
+                detections = [d for d in detections if d.class_name != "ball"]
+                detections += detector.detect_ball_tiled(frame)
+
+            # Update tracker (frame passed through for jersey-color team assignment)
+            active_tracks = tracker.update(detections, frame_no, frame=frame)
 
             # Build Detection ORM records
             for d in detections:
@@ -100,6 +135,11 @@ def track_players_task(self, match_id: str, s3_url: str = None) -> Dict[str, Any
                 )
 
         cap.release()
+
+        # Fold the re-ID gallery (players lost near the very end of the video, still within
+        # their re-ID window) back into the active track set so their history isn't silently
+        # dropped from the final player/stats output.
+        tracker.tracks.update(tracker.lost_gallery)
 
         # Batch insert detections
         if all_detections_batch:

@@ -5,8 +5,19 @@ from app.cv.events import EventDetector
 from app.cv.stats import StatsCalculator
 
 
-def test_yolo_detector_and_fallback():
+def test_yolo_detector_real_empty_frame_stays_empty():
+    # On real footage, a frame with no actual COCO objects (blank canvas, intro card,
+    # nobody in view) must return no detections - never fabricated player positions.
     detector = YOLOv8Detector(model_path="yolov8n.pt", conf_threshold=0.3)
+    frame = np.full((720, 1280, 3), (34, 139, 34), dtype=np.uint8)
+    detections = detector.detect_frame(frame)
+    assert detections == []
+
+
+def test_yolo_detector_synthetic_fallback_opt_in():
+    # The synthetic simulation is only for the drawn-shape demo video, and only runs
+    # when explicitly enabled.
+    detector = YOLOv8Detector(model_path="yolov8n.pt", conf_threshold=0.3, allow_fallback_on_empty=True)
     frame = np.full((720, 1280, 3), (34, 139, 34), dtype=np.uint8)
     detections = detector.detect_frame(frame)
 

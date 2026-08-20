@@ -30,7 +30,6 @@ from app.config import settings
 from app.db.database import engine, SessionLocal, Base
 from app.db.models import Camera, Match, MatchStatus, Player, Detection, Event, PlayerStat
 from app.tasks.pipeline import trigger_match_pipeline
-from app.tasks.ingest import generate_synthetic_match_video
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s]: %(message)s")
 logger = logging.getLogger("gaffer.demo")
@@ -75,18 +74,13 @@ def main():
     db.refresh(match)
     print(f"✅ Match Session Created: ID={match.id}, Title='{match.title}'")
 
-    # 4. Generate Synthetic Video Clip
-    logger.info("Step 4: Generating synthetic 5-second 1080p turf video clip...")
-    video_path = f"/tmp/gaffer/storage/{match.id}.mp4"
-    generate_synthetic_match_video(video_path, duration_sec=5, fps=30)
-    match.video_s3_url = video_path
-    db.commit()
-    print(f"✅ Video Generated at: {video_path}")
-
-    # 5. Execute Synchronous CV Pipeline
-    logger.info("Step 5: Executing Computer Vision Pipeline (Detect ➔ Track ➔ Events ➔ Stats)...")
-    result = trigger_match_pipeline(match_id=match.id, s3_url=video_path, run_async=False)
-    print(f"✅ Pipeline Execution Finished: {result}")
+    # 4. Execute Synchronous CV Pipeline
+    # The "synthetic" sentinel tells the pipeline to generate its own drawn-shape demo clip
+    # and run detection in simulation mode - real match footage never takes this path, so
+    # a genuinely empty real-world frame is never mistaken for one that needs simulating.
+    logger.info("Step 4: Executing Computer Vision Pipeline (Detect ➔ Track ➔ Events ➔ Stats)...")
+    result = trigger_match_pipeline(match_id=match.id, s3_url="synthetic", run_async=False)
+    print(f"✅ Video generated & Pipeline Execution Finished: {result}")
 
     # 6. Query Match Results from PostgreSQL / DB
     logger.info("Step 6: Querying results from database...")

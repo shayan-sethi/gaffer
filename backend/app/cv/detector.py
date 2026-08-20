@@ -1,5 +1,5 @@
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -24,29 +24,86 @@ class DetectionResult:
 class YOLOv8Detector:
     """
     YOLOv8 wrapper for football player and ball detection.
-    COCO Classes:
-    - 0: person (players, referees, goalkeepers)
-    - 32: sports ball (football)
+
+    Class IDs aren't assumed - they're read off the loaded model's own
+    `names` mapping, since a COCO checkpoint (0=person, 32=sports ball) and
+    our ball+player fine-tune (0=ball, 1=player) use different IDs for the
+    same two concepts.
     """
 
-    TARGET_CLASSES = {
-        0: "player",
-        32: "ball",
+    # Recognized model class names -> our internal label.
+    NAME_MAP = {
+        "person": "player",
+        "player": "player",
+        "sports ball": "ball",
+        "ball": "ball",
     }
 
-    def __init__(self, model_path: str = "yolov8n.pt", conf_threshold: float = 0.3, iou_threshold: float = 0.45):
+    def __init__(
+        self,
+        model_path: str = "yolov8n.pt",
+        conf_threshold: float = 0.3,
+        iou_threshold: float = 0.45,
+        device: Optional[str] = None,
+        allow_fallback_on_empty: bool = False,
+        img_size: int = 640,
+    ):
         self.model_path = model_path
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
+        # Inference resolution. Counterintuitively, going above YOLO's native 640px on
+        # real turf footage catches a few more far-field players per frame but makes
+        # boxes jitter more frame-to-frame - net effect measured worse (more, not less,
+        # track fragmentation) on real match video, so 640 is the tested default.
+        self.img_size = img_size
         self.model = None
+        # id -> our label ("player"/"ball"), populated from the model's own
+        # names once loaded. self.ball_class_id is the model's own id for
+        # "ball", used by detect_ball_tiled.
+        self.class_map: Dict[int, str] = {}
+        self.ball_class_id: Optional[int] = None
+        # Synthetic simulation is only meaningful for the drawn-shape demo video (no real
+        # COCO objects to detect there). On real footage, a genuinely empty frame (blank
+        # intro card, no one in view, ball out of shot) must stay empty - not be replaced
+        # with fabricated player positions.
+        self.allow_fallback_on_empty = allow_fallback_on_empty
+
+        # Auto-detect best hardware acceleration
+        if device:
+            self.device = device
+        else:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    self.device = "cuda"
+                elif torch.backends.mps.is_available():
+                    self.device = "mps"
+                else:
+                    self.device = "cpu"
+            except Exception:
+                self.device = "cpu"
+
         self._load_model()
 
     def _load_model(self):
         try:
             from ultralytics import YOLO
-            logger.info(f"Loading YOLOv8 model from {self.model_path}...")
+            logger.info(f"Loading YOLOv8 model from {self.model_path} (device: {self.device})...")
             self.model = YOLO(self.model_path)
-            logger.info("YOLOv8 model loaded successfully.")
+            # Transfer model to device
+            if self.device != "cpu":
+                self.model.to(self.device)
+
+            self.class_map = {
+                cls_id: self.NAME_MAP[name]
+                for cls_id, name in self.model.names.items()
+                if name in self.NAME_MAP
+            }
+            self.ball_class_id = next(
+                (cls_id for cls_id, label in self.class_map.items() if label == "ball"),
+                None,
+            )
+            logger.info(f"YOLOv8 model loaded successfully. class_map={self.class_map}")
         except Exception as e:
             logger.warning(f"Could not load ultralytics YOLO model ({e}). Will use fallback/synthetic detector.")
             self.model = None
@@ -60,12 +117,14 @@ class YOLOv8Detector:
             return self._fallback_detect(frame)
 
         try:
-            # Run inference
+            # Run inference with GPU acceleration
             results = self.model(
                 frame,
                 conf=self.conf_threshold,
                 iou=self.iou_threshold,
-                classes=list(self.TARGET_CLASSES.keys()),
+                classes=list(self.class_map.keys()),
+                device=self.device,
+                imgsz=self.img_size,
                 verbose=False,
             )
 
@@ -76,7 +135,7 @@ class YOLOv8Detector:
                     cls_id = int(box.cls[0].item())
                     conf = float(box.conf[0].item())
                     xyxy = box.xyxy[0].tolist()  # [x1, y1, x2, y2]
-                    class_name = self.TARGET_CLASSES.get(cls_id, "unknown")
+                    class_name = self.class_map.get(cls_id, "unknown")
 
                     detections.append(
                         DetectionResult(
@@ -86,13 +145,109 @@ class YOLOv8Detector:
                             class_id=cls_id,
                         )
                     )
-            # If standard COCO model finds nothing on a synthetic canvas, supplement with simulation
-            if len(detections) == 0:
+            # On the synthetic demo canvas, the real model finds no COCO objects (they're
+            # drawn shapes) - supplement with simulation there only, never on real footage.
+            if len(detections) == 0 and self.allow_fallback_on_empty:
                 return self._fallback_detect(frame)
             return detections
         except Exception as e:
             logger.error(f"Inference error with YOLOv8: {e}")
-            return self._fallback_detect(frame)
+            if self.allow_fallback_on_empty:
+                return self._fallback_detect(frame)
+            return []
+
+    def detect_ball_tiled(
+        self,
+        frame: np.ndarray,
+        grid: Tuple[int, int] = (2, 2),
+        overlap: float = 0.15,
+        conf_threshold: Optional[float] = None,
+    ) -> List[DetectionResult]:
+        """
+        Ball-only detection over overlapping tiles of the frame, effectively boosting
+        the model's resolution for the single hardest class to see at broadcast camera
+        distance (a football is a handful of low-contrast, often motion-blurred pixels
+        in a 1080p+ wide shot - well outside YOLO's native 640px input). Players don't
+        need this: a single full-frame pass already finds them reliably.
+
+        Meaningfully more expensive than a single pass (cols*rows extra inference calls
+        per frame) - only worth it when ball detection actually matters for the match
+        (goal/pass/possession events depend on it).
+        """
+        if self.model is None or self.ball_class_id is None:
+            return []
+
+        # Ball detection lives in a much lower confidence regime than player detection on
+        # this kind of footage - measured hit rate goes from ~0% at 0.15+ to a real (if
+        # still sparse) ~13% at 0.08 on actual match video. Tuned empirically, not a
+        # fraction of the (unrelated) player confidence threshold.
+        conf = conf_threshold if conf_threshold is not None else 0.08
+        h, w = frame.shape[:2]
+        cols, rows = grid
+        tile_w, tile_h = w / cols, h / rows
+        pad_w, pad_h = tile_w * overlap, tile_h * overlap
+
+        all_dets: List[DetectionResult] = []
+        for r in range(rows):
+            for c in range(cols):
+                x1 = max(0, int(c * tile_w - pad_w))
+                y1 = max(0, int(r * tile_h - pad_h))
+                x2 = min(w, int((c + 1) * tile_w + pad_w))
+                y2 = min(h, int((r + 1) * tile_h + pad_h))
+                tile = frame[y1:y2, x1:x2]
+                if tile.size == 0:
+                    continue
+
+                try:
+                    results = self.model(
+                        tile,
+                        conf=conf,
+                        iou=self.iou_threshold,
+                        classes=[self.ball_class_id],
+                        device=self.device,
+                        imgsz=self.img_size,
+                        verbose=False,
+                    )
+                except Exception as e:
+                    logger.error(f"Tiled ball inference error: {e}")
+                    continue
+
+                for res in results:
+                    for box in res.boxes:
+                        bx1, by1, bx2, by2 = box.xyxy[0].tolist()
+                        all_dets.append(
+                            DetectionResult(
+                                class_name="ball",
+                                bbox=[bx1 + x1, by1 + y1, bx2 + x1, by2 + y1],
+                                confidence=float(box.conf[0].item()),
+                                class_id=self.ball_class_id,
+                            )
+                        )
+
+        return self._dedup_ball_detections(all_dets)
+
+    def _dedup_ball_detections(self, detections: List[DetectionResult]) -> List[DetectionResult]:
+        """Overlapping tiles can both catch a ball near their shared border - keep the highest-confidence box."""
+        if len(detections) <= 1:
+            return detections
+        detections = sorted(detections, key=lambda d: d.confidence, reverse=True)
+        kept: List[DetectionResult] = []
+        for d in detections:
+            if not any(self._iou(d.bbox, k.bbox) > 0.3 for k in kept):
+                kept.append(d)
+        return kept
+
+    @staticmethod
+    def _iou(a: List[float], b: List[float]) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
 
     def _fallback_detect(self, frame: np.ndarray) -> List[DetectionResult]:
         """

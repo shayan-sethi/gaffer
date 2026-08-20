@@ -1,8 +1,10 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.db.init_db import init_db
@@ -70,12 +72,17 @@ app.include_router(matches_router, prefix=settings.API_V1_STR)
 app.include_router(events_router, prefix=settings.API_V1_STR)
 app.include_router(stats_router, prefix=settings.API_V1_STR)
 
+# Barebones match-visualization dashboard (static HTML/JS, no build step)
+_static_dir = os.path.join(os.path.dirname(__file__), "static")
+app.mount("/ui", StaticFiles(directory=_static_dir, html=True), name="ui")
+
 
 @app.get("/")
 def root():
     return {
         "name": settings.PROJECT_NAME,
         "status": "online",
+        "ui": "/ui",
         "docs": "/docs",
         "health": "/health",
         "version": "1.0.0",

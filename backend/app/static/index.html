@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gaffer — Match Intelligence</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #131a23;
+    --panel-border: #223041;
+    --text: #e6edf3;
+    --muted: #7d8b99;
+    --home: #4f9bff;
+    --away: #ff6b6b;
+    --accent: #34d399;
+    --warn: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--panel-border);
+    background: var(--panel);
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  header h1 span { color: var(--accent); }
+  select, button {
+    background: #1b2530;
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  main {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+    display: grid;
+    grid-template-columns: 1.3fr 1fr;
+    gap: 16px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .panel h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin: 0 0 12px 0;
+  }
+  .scoreboard {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 24px;
+    padding: 12px 0 20px 0;
+  }
+  .team-score { text-align: center; }
+  .team-score .name { font-size: 13px; color: var(--muted); }
+  .team-score .val { font-size: 40px; font-weight: 700; }
+  .team-score.home .val { color: var(--home); }
+  .team-score.away .val { color: var(--away); }
+  .vs { color: var(--muted); font-size: 20px; }
+  .possession-bar {
+    display: flex;
+    height: 10px;
+    border-radius: 6px;
+    overflow: hidden;
+    margin: 6px 0 4px 0;
+  }
+  .possession-bar .home { background: var(--home); }
+  .possession-bar .away { background: var(--away); }
+  .possession-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .status-badge {
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: #1b2530;
+    border: 1px solid var(--panel-border);
+    text-transform: uppercase;
+  }
+  .status-COMPLETED { color: var(--accent); border-color: var(--accent); }
+  .status-PROCESSING { color: var(--warn); border-color: var(--warn); }
+  .status-FAILED { color: var(--away); border-color: var(--away); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--panel-border); }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; cursor: pointer; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: #1b2530; }
+  tbody tr.selected { background: #1e2b3d; }
+  .team-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .team-dot.HOME { background: var(--home); }
+  .team-dot.AWAY { background: var(--away); }
+  .team-dot.UNASSIGNED, .team-dot.REFEREE { background: var(--muted); }
+
+  .events-list { max-height: 320px; overflow-y: auto; }
+  .event-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--panel-border);
+    font-size: 13px;
+  }
+  .event-row:last-child { border-bottom: none; }
+  .event-time { color: var(--muted); font-variant-numeric: tabular-nums; width: 52px; }
+  .event-type {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+    text-transform: uppercase;
+  }
+  .event-type.GOAL { background: rgba(52, 211, 153, 0.15); color: var(--accent); }
+  .event-type.SHOT { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
+  .event-type.PASS { background: rgba(79, 155, 255, 0.15); color: var(--home); }
+  .event-type.POSSESSION_CHANGE { background: rgba(255, 107, 107, 0.15); color: var(--away); }
+  .empty-state { color: var(--muted); font-size: 13px; padding: 20px 0; text-align: center; }
+
+  canvas#heatmap { width: 100%; height: auto; border-radius: 6px; display: block; }
+  .heatmap-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;}
+  .heatmap-header h2 { margin: 0; }
+  .heatmap-player-name { font-size: 13px; color: var(--muted); }
+
+  .full-span { grid-column: 1 / -1; }
+  @media (max-width: 860px) {
+    main { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⚽ Gaffer <span>Match Intelligence</span></h1>
+  <div style="display:flex; gap:10px; align-items:center;">
+    <select id="matchSelect"><option>Loading matches...</option></select>
+    <button id="refreshBtn">Refresh</button>
+  </div>
+</header>
+
+<main id="app" style="display:none;">
+
+  <div class="panel">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h2 id="matchTitle">Match</h2>
+      <span id="statusBadge" class="status-badge">-</span>
+    </div>
+    <div class="scoreboard">
+      <div class="team-score home"><div class="name">HOME</div><div class="val" id="homeScore">-</div></div>
+      <div class="vs">vs</div>
+      <div class="team-score away"><div class="name">AWAY</div><div class="val" id="awayScore">-</div></div>
+    </div>
+    <div class="possession-bar">
+      <div class="home" id="possHomeBar" style="width:50%"></div>
+      <div class="away" id="possAwayBar" style="width:50%"></div>
+    </div>
+    <div class="possession-labels">
+      <span id="possHomeLabel">Possession 50%</span>
+      <span id="possAwayLabel">Possession 50%</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Detected Events</h2>
+    <div class="events-list" id="eventsList"><div class="empty-state">No events yet</div></div>
+  </div>
+
+  <div class="panel full-span">
+    <h2>Players — click a row for their heatmap</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Player</th>
+          <th>Team</th>
+          <th>Distance (m)</th>
+          <th>Top Speed (km/h)</th>
+          <th>Passes</th>
+          <th>Shots</th>
+        </tr>
+      </thead>
+      <tbody id="playersBody">
+        <tr><td colspan="6" class="empty-state">No player stats yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel full-span">
+    <div class="heatmap-header">
+      <h2>Pitch Heatmap</h2>
+      <span class="heatmap-player-name" id="heatmapPlayerName">Select a player above</span>
+    </div>
+    <canvas id="heatmap" width="900" height="450"></canvas>
+  </div>
+
+</main>
+
+<div id="emptyState" class="empty-state" style="padding: 60px; font-size: 14px;">Loading matches...</div>
+
+<script>
+const API = "/api";
+let currentStats = null;
+
+async function fetchJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} -> ${res.status}`);
+  return res.json();
+}
+
+function fmtTime(ms) {
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+async function loadMatches() {
+  const select = document.getElementById("matchSelect");
+  try {
+    const matches = await fetchJSON(`${API}/matches?limit=50`);
+    if (matches.length === 0) {
+      document.getElementById("emptyState").textContent = "No matches found. Trigger a match pipeline first.";
+      return;
+    }
+    select.innerHTML = matches.map(m =>
+      `<option value="${m.id}">${m.title} — ${m.status} (${new Date(m.date).toLocaleDateString()})</option>`
+    ).join("");
+    document.getElementById("emptyState").style.display = "none";
+    document.getElementById("app").style.display = "grid";
+    await loadMatch(select.value);
+  } catch (e) {
+    document.getElementById("emptyState").textContent = "Could not reach the Gaffer API. Is the backend running?";
+  }
+}
+
+async function loadMatch(matchId) {
+  if (!matchId) return;
+  const [stats, events] = await Promise.all([
+    fetchJSON(`${API}/matches/${matchId}/stats`).catch(() => null),
+    fetchJSON(`${API}/matches/${matchId}/events`).catch(() => []),
+  ]);
+  currentStats = stats;
+  const match = await fetchJSON(`${API}/matches/${matchId}`).catch(() => null);
+
+  renderHeader(match, stats);
+  renderEvents(events);
+  renderPlayers(stats);
+
+  // Auto-select the top player's heatmap
+  if (stats && stats.player_stats.length > 0) {
+    const top = [...stats.player_stats].sort((a, b) => b.distance_m - a.distance_m)[0];
+    selectPlayer(top);
+  }
+}
+
+function renderHeader(match, stats) {
+  document.getElementById("matchTitle").textContent = match ? match.title : "Match";
+  const badge = document.getElementById("statusBadge");
+  const status = match ? match.status : "UNKNOWN";
+  badge.textContent = status;
+  badge.className = `status-badge status-${status}`;
+
+  if (!stats) return;
+  document.getElementById("homeScore").textContent = stats.home_score;
+  document.getElementById("awayScore").textContent = stats.away_score;
+  document.getElementById("possHomeBar").style.width = `${stats.home_possession_pct}%`;
+  document.getElementById("possAwayBar").style.width = `${stats.away_possession_pct}%`;
+  document.getElementById("possHomeLabel").textContent = `HOME possession ${stats.home_possession_pct}%`;
+  document.getElementById("possAwayLabel").textContent = `AWAY possession ${stats.away_possession_pct}%`;
+}
+
+function renderEvents(events) {
+  const list = document.getElementById("eventsList");
+  if (!events || events.length === 0) {
+    list.innerHTML = `<div class="empty-state">No discrete goal/pass events detected in this clip window</div>`;
+    return;
+  }
+  list.innerHTML = events.slice().reverse().map(e => `
+    <div class="event-row">
+      <span class="event-time">${fmtTime(e.timestamp_ms)}</span>
+      <span class="event-type ${e.event_type}">${e.event_type.replace("_", " ")}</span>
+      <span>${e.team || ""}</span>
+    </div>
+  `).join("");
+}
+
+function renderPlayers(stats) {
+  const body = document.getElementById("playersBody");
+  if (!stats || stats.player_stats.length === 0) {
+    body.innerHTML = `<tr><td colspan="6" class="empty-state">No player stats yet</td></tr>`;
+    return;
+  }
+  const sorted = [...stats.player_stats].sort((a, b) => b.distance_m - a.distance_m);
+  body.innerHTML = sorted.map(p => `
+    <tr data-player-id="${p.player_id}">
+      <td>${p.player_name || "Player"}</td>
+      <td><span class="team-dot ${p.team || "UNASSIGNED"}"></span>${p.team || "-"}</td>
+      <td>${p.distance_m.toFixed(1)}</td>
+      <td>${p.top_speed_kmh.toFixed(1)}</td>
+      <td>${p.passes}</td>
+      <td>${p.shots}</td>
+    </tr>
+  `).join("");
+
+  body.querySelectorAll("tr[data-player-id]").forEach(row => {
+    row.addEventListener("click", () => {
+      const p = stats.player_stats.find(x => x.player_id === row.dataset.playerId);
+      if (p) selectPlayer(p);
+      body.querySelectorAll("tr").forEach(r => r.classList.remove("selected"));
+      row.classList.add("selected");
+    });
+  });
+}
+
+function selectPlayer(p) {
+  document.getElementById("heatmapPlayerName").textContent =
+    `${p.player_name || "Player"} (${p.team || "-"})`;
+  drawHeatmap(p.heatmap_json);
+}
+
+function drawHeatmap(grid) {
+  const canvas = document.getElementById("heatmap");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // Pitch background
+  ctx.fillStyle = "#0e1b12";
+  ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = "#2c4c34";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(8, 8, W - 16, H - 16);
+  ctx.beginPath();
+  ctx.moveTo(W / 2, 8);
+  ctx.lineTo(W / 2, H - 8);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(W / 2, H / 2, 45, 0, Math.PI * 2);
+  ctx.stroke();
+
+  if (!grid || grid.length === 0) return;
+  const rows = grid.length, cols = grid[0].length;
+  const cellW = (W - 16) / cols, cellH = (H - 16) / rows;
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const v = grid[r][c];
+      if (v <= 0) continue;
+      const alpha = Math.min(1, v);
+      ctx.fillStyle = `rgba(255, ${Math.round(180 - v * 140)}, 60, ${0.15 + alpha * 0.7})`;
+      ctx.fillRect(8 + c * cellW, 8 + r * cellH, cellW + 1, cellH + 1);
+    }
+  }
+}
+
+document.getElementById("matchSelect").addEventListener("change", (e) => loadMatch(e.target.value));
+document.getElementById("refreshBtn").addEventListener("click", () => {
+  const id = document.getElementById("matchSelect").value;
+  loadMatch(id);
+});
+
+loadMatches();
+</script>
+</body>
+</html>

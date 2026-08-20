@@ -34,6 +34,7 @@ storage/
 *.mp4
 *.avi
 *.mov
+*.crdownload
 
 # Environment variables
 .env
@@ -48,3 +49,12 @@ storage/
 # OS
 .DS_Store
 Thumbs.db
+
+# ML datasets / training runs / model weights - large and regenerable.
+# The one exception is the shipped fine-tuned checkpoint the app actually
+# loads at runtime, which is small enough to track directly.
+/roboflow data/
+/datasets/
+/runs/
+*.pt
+!backend/app/models/*.pt

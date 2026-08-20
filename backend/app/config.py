@@ -1,5 +1,10 @@
 import os
+from pathlib import Path
 from typing import Optional
+
+# Resolved relative to this file so it works regardless of the process's cwd
+# (uvicorn, celery worker, scripts/, etc. all launch from different directories).
+_DEFAULT_MODEL_PATH = str(Path(__file__).resolve().parent / "models" / "ball_player_v1.pt")
 
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -38,9 +43,10 @@ try:
         S3_REGION: str = "us-east-1"
         S3_USE_SSL: bool = False
 
-        YOLO_MODEL_PATH: str = "yolov8n.pt"
+        YOLO_MODEL_PATH: str = _DEFAULT_MODEL_PATH
         CONFIDENCE_THRESHOLD: float = 0.35
         IOU_THRESHOLD: float = 0.45
+        YOLO_IMG_SIZE: int = 640
         STORAGE_LOCAL_DIR: str = "/tmp/gaffer/storage"
 
         @property
@@ -96,9 +102,10 @@ except Exception:
             S3_REGION: str = "us-east-1"
             S3_USE_SSL: bool = False
 
-            YOLO_MODEL_PATH: str = "yolov8n.pt"
+            YOLO_MODEL_PATH: str = _DEFAULT_MODEL_PATH
             CONFIDENCE_THRESHOLD: float = 0.35
             IOU_THRESHOLD: float = 0.45
+            YOLO_IMG_SIZE: int = 640
             STORAGE_LOCAL_DIR: str = "/tmp/gaffer/storage"
 
             @property
@@ -156,9 +163,10 @@ except Exception:
             S3_REGION: str = os.getenv("S3_REGION", "us-east-1")
             S3_USE_SSL: bool = os.getenv("S3_USE_SSL", "False").lower() in ("true", "1")
 
-            YOLO_MODEL_PATH: str = os.getenv("YOLO_MODEL_PATH", "yolov8n.pt")
+            YOLO_MODEL_PATH: str = os.getenv("YOLO_MODEL_PATH", _DEFAULT_MODEL_PATH)
             CONFIDENCE_THRESHOLD: float = float(os.getenv("CONFIDENCE_THRESHOLD", "0.35"))
             IOU_THRESHOLD: float = float(os.getenv("IOU_THRESHOLD", "0.45"))
+            YOLO_IMG_SIZE: int = int(os.getenv("YOLO_IMG_SIZE", "640"))
             STORAGE_LOCAL_DIR: str = os.getenv("STORAGE_LOCAL_DIR", "/tmp/gaffer/storage")
 
             @property
