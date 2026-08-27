@@ -11,17 +11,32 @@ If no path is provided, it checks for any .mp4 file in `test_videos/`.
 import os
 import sys
 import json
+import pickle
 import logging
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "backend")))
 
+# Stored under the repo (gitignored), not system /tmp - some sandboxes wipe
+# /tmp between sessions, which previously destroyed the DB and tracking cache.
+LOCAL_DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".local_data"))
+os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(LOCAL_DATA_DIR, "gaffer_test.db")
+
 # Default to SQLite for quick local test
 if not os.getenv("DATABASE_URL") and not os.getenv("POSTGRES_SERVER"):
-    os.environ["DATABASE_URL"] = "sqlite:////tmp/gaffer_test.db"
+    os.environ["DATABASE_URL"] = f"sqlite:///{DB_PATH}"
 
 from app.db.database import engine, SessionLocal, Base
 from app.db.models import Camera, Match, MatchStatus, Player, Detection, Event, PlayerStat
-from app.tasks.pipeline import trigger_match_pipeline
+from app.tasks.track import track_players_task
+from app.tasks.events import detect_events_task
+from app.tasks.stats import aggregate_stats_task
+
+# Cache the (expensive, ~15-20min) tracking pass to disk so events/stats-only
+# tuning iterations (thresholds, xG formula, sprint logic) don't require
+# re-running YOLO detection + tracking over the whole video every time.
+# Pass --retrack to force a fresh tracking pass (e.g. after a detector/tracker change).
+TRACKING_CACHE_DIR = os.path.join(LOCAL_DATA_DIR, "tracking_cache")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s]: %(message)s")
 logger = logging.getLogger("gaffer.test_video")
@@ -51,6 +66,11 @@ def main():
         print(f"❌ Error: Video file '{video_path}' not found.")
         sys.exit(1)
 
+    force_retrack = "--retrack" in sys.argv
+    os.makedirs(TRACKING_CACHE_DIR, exist_ok=True)
+    cache_key = os.path.basename(video_path).replace("/", "_")
+    cache_path = os.path.join(TRACKING_CACHE_DIR, f"{cache_key}.pkl")
+
     print("=" * 70)
     print(f"⚽ Processing Video: {video_path}")
     print("=" * 70)
@@ -72,21 +92,45 @@ def main():
         db.refresh(cam)
 
     match_title = os.path.splitext(os.path.basename(video_path))[0]
-    match = Match(
-        camera_id=cam.id,
-        title=f"Test: {match_title}",
-        video_s3_url=video_path,
-        status=MatchStatus.PROCESSING,
-    )
-    db.add(match)
-    db.commit()
-    db.refresh(match)
 
-    print(f"Created Match ID: {match.id}")
-    print("Running YOLOv8 Detection + Centroid Tracking + Event Analysis...")
+    # 3. Execute CV Pipeline. Tracking (YOLO detection + Hungarian/Re-ID) is by
+    # far the most expensive stage (~15-20min for a full match), so it's
+    # cached to disk keyed by video filename - event/stat threshold tuning
+    # iterations reuse the cached tracks instead of reprocessing the video.
+    # Reuses the SAME match_id the cached tracking pass was produced under
+    # (Player rows are only ever created during tracking, so a fresh Match
+    # row would have no players for events/stats to attach to).
+    if not force_retrack and os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            tracking_result = pickle.load(f)
+        match = db.query(Match).filter(Match.id == tracking_result["match_id"]).first()
+        print(f"♻️  Reusing cached tracking pass from {cache_path} (match {match.id}); pass --retrack to force a fresh one")
+        match.status = MatchStatus.PROCESSING
+        # Clear stale events/stats from the previous run so aggregate_stats_task
+        # (which sums over these tables) doesn't double-count.
+        db.query(Event).filter(Event.match_id == match.id).delete()
+        db.query(PlayerStat).filter(PlayerStat.match_id == match.id).delete()
+        db.commit()
+    else:
+        match = Match(
+            camera_id=cam.id,
+            title=f"Test: {match_title}",
+            video_s3_url=video_path,
+            status=MatchStatus.PROCESSING,
+        )
+        db.add(match)
+        db.commit()
+        db.refresh(match)
+        print(f"Created Match ID: {match.id}")
+        print("Running YOLOv8 Detection + Centroid Tracking...")
+        tracking_result = track_players_task(match.id, video_path)
+        with open(cache_path, "wb") as f:
+            pickle.dump(tracking_result, f)
+        print(f"💾 Cached tracking pass to {cache_path}")
 
-    # 3. Execute CV Pipeline
-    result = trigger_match_pipeline(match_id=match.id, s3_url=video_path, run_async=False)
+    print("Running Event Analysis + Stats Aggregation...")
+    event_result = detect_events_task(tracking_result)
+    result = aggregate_stats_task(event_result)
 
     # 4. Fetch & display results
     db.refresh(match)
@@ -121,7 +165,7 @@ def main():
             print(f"   |{line}|")
 
     print("\n" + "=" * 70)
-    print(f"Results stored in SQLite: /tmp/gaffer_test.db")
+    print(f"Results stored in SQLite: {DB_PATH}")
     print("=" * 70)
     db.close()
 

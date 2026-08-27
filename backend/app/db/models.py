@@ -130,6 +130,8 @@ class PlayerStat(Base):
     player_id = Column(String(36), ForeignKey("players.id"), nullable=False)
     distance_m = Column(Float, default=0.0)
     top_speed_kmh = Column(Float, default=0.0)
+    avg_speed_kmh = Column(Float, default=0.0)
+    sprints = Column(Integer, default=0)
     passes = Column(Integer, default=0)
     shots = Column(Integer, default=0)
     possession_pct = Column(Float, default=0.0)

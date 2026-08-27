@@ -25,17 +25,29 @@ def get_match_stats(match_id: str, db: Session = Depends(get_db)):
     home_score = sum(1 for e in events if e.event_type == "GOAL" and e.team == "HOME")
     away_score = sum(1 for e in events if e.event_type == "GOAL" and e.team == "AWAY")
 
+    home_xg = round(sum((e.data_json or {}).get("xg", 0.0) for e in events if e.event_type == "SHOT" and e.team == "HOME"), 3)
+    away_xg = round(sum((e.data_json or {}).get("xg", 0.0) for e in events if e.event_type == "SHOT" and e.team == "AWAY"), 3)
+    home_corners = sum(1 for e in events if e.event_type == "CORNER" and e.team == "HOME")
+    away_corners = sum(1 for e in events if e.event_type == "CORNER" and e.team == "AWAY")
+
     # Aggregate distances, passes, shots
     total_distance = sum(s.distance_m for s in stats)
     total_shots = sum(s.shots for s in stats)
     total_passes = sum(s.passes for s in stats)
 
-    # Compute team possession
-    home_passes = sum(s.passes for s in stats if s.player and s.player.team == "HOME")
-    away_passes = sum(s.passes for s in stats if s.player and s.player.team == "AWAY")
-    total_p = home_passes + away_passes
-    home_possession = round((home_passes / total_p) * 100, 1) if total_p > 0 else 50.0
-    away_possession = round(100.0 - home_possession, 1)
+    # Team possession - actual time-in-possession (see EventDetector.possession_frames),
+    # stored on the match at aggregation time. Falls back to the old pass-count-ratio
+    # proxy only for matches processed before this was tracked.
+    stored_possession = (match.meta_data or {}).get("possession_pct")
+    if stored_possession:
+        home_possession = stored_possession["home"]
+        away_possession = stored_possession["away"]
+    else:
+        home_passes = sum(s.passes for s in stats if s.player and s.player.team == "HOME")
+        away_passes = sum(s.passes for s in stats if s.player and s.player.team == "AWAY")
+        total_p = home_passes + away_passes
+        home_possession = round((home_passes / total_p) * 100, 1) if total_p > 0 else 50.0
+        away_possession = round(100.0 - home_possession, 1)
 
     player_stat_responses: List[PlayerStatResponse] = []
     for s in stats:
@@ -49,6 +61,8 @@ def get_match_stats(match_id: str, db: Session = Depends(get_db)):
                 team=s.player.team if s.player else None,
                 distance_m=round(s.distance_m, 2),
                 top_speed_kmh=round(s.top_speed_kmh, 2),
+                avg_speed_kmh=round(s.avg_speed_kmh, 2),
+                sprints=s.sprints,
                 passes=s.passes,
                 shots=s.shots,
                 possession_pct=round(s.possession_pct, 1),
@@ -67,6 +81,11 @@ def get_match_stats(match_id: str, db: Session = Depends(get_db)):
         total_distance_m=round(total_distance, 2),
         total_shots=total_shots,
         total_passes=total_passes,
+        zone_touches=(match.meta_data or {}).get("zone_touches"),
+        home_xg=home_xg,
+        away_xg=away_xg,
+        home_corners=home_corners,
+        away_corners=away_corners,
         player_stats=player_stat_responses,
     )
 
@@ -91,6 +110,8 @@ def get_player_stat(match_id: str, player_id: str, db: Session = Depends(get_db)
         team=stat.player.team if stat.player else None,
         distance_m=round(stat.distance_m, 2),
         top_speed_kmh=round(stat.top_speed_kmh, 2),
+        avg_speed_kmh=round(stat.avg_speed_kmh, 2),
+        sprints=stat.sprints,
         passes=stat.passes,
         shots=stat.shots,
         possession_pct=round(stat.possession_pct, 1),

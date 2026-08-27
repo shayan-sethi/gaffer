@@ -137,7 +137,35 @@
   .event-type.SHOT { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
   .event-type.PASS { background: rgba(79, 155, 255, 0.15); color: var(--home); }
   .event-type.POSSESSION_CHANGE { background: rgba(255, 107, 107, 0.15); color: var(--away); }
+  .event-type.CORNER { background: rgba(167, 139, 250, 0.15); color: #a78bfa; }
+  .event-xg { color: var(--muted); font-size: 12px; margin-left: auto; }
+
+  .xg-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--panel-border);
+  }
+  .xg-row .val { color: var(--text); font-weight: 600; }
   .empty-state { color: var(--muted); font-size: 13px; padding: 20px 0; text-align: center; }
+
+  /* Marks stats derived from heuristics/approximate models (xG, shot/corner
+     detection) rather than direct measurement (goals, distance, possession) -
+     these are useful signal, not precise counts, and shouldn't be presented
+     with the same confidence as the directly-measured stats. */
+  .est-badge {
+    font-size: 9px;
+    color: var(--muted);
+    border: 1px solid var(--panel-border);
+    border-radius: 3px;
+    padding: 0 3px;
+    margin-left: 4px;
+    vertical-align: middle;
+    cursor: help;
+  }
 
   canvas#heatmap { width: 100%; height: auto; border-radius: 6px; display: block; }
   .heatmap-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;}
@@ -148,6 +176,45 @@
   @media (max-width: 860px) {
     main { grid-template-columns: 1fr; }
   }
+
+  .performer-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .performer-card {
+    background: #1b2530;
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 12px;
+  }
+  .performer-card .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .performer-card .name { font-size: 14px; font-weight: 600; margin: 6px 0 2px 0; }
+  .performer-card .metric { font-size: 22px; font-weight: 700; color: var(--accent); }
+  .performer-card .metric .unit { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 3px; }
+
+  canvas#formation { width: 100%; height: auto; border-radius: 6px; display: block; }
+
+  .compare-row { display: grid; grid-template-columns: 70px 1fr 70px; align-items: center; gap: 12px; padding: 10px 0; }
+  .compare-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 34px;
+    height: 26px;
+    padding: 0 8px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: 700;
+    color: #fff;
+  }
+  .compare-row .home-cell { display: flex; justify-content: flex-end; }
+  .compare-row .away-cell { display: flex; justify-content: flex-start; }
+  .compare-pill.home { background: var(--home); }
+  .compare-pill.away { background: var(--away); }
+  .compare-pill.muted { background: #2a3644; color: var(--muted); }
+  .compare-row .metric-label { text-align: center; color: var(--muted); font-size: 12px; }
+  .zone-row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+  .zone-label { width: 90px; font-size: 12px; color: var(--muted); text-align: right; }
+  .zone-bar-track { flex: 1; display: flex; height: 22px; border-radius: 6px; overflow: hidden; background: #1b2530; }
+  .zone-bar-track .home-fill { background: var(--home); display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; }
+  .zone-bar-track .away-fill { background: var(--away); display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; }
 </style>
 </head>
 <body>
@@ -180,11 +247,22 @@
       <span id="possHomeLabel">Possession 50%</span>
       <span id="possAwayLabel">Possession 50%</span>
     </div>
+    <div class="xg-row" id="xgRow"></div>
   </div>
 
   <div class="panel">
     <h2>Detected Events</h2>
     <div class="events-list" id="eventsList"><div class="empty-state">No events yet</div></div>
+  </div>
+
+  <div class="panel full-span">
+    <h2>Top Performers</h2>
+    <div class="performer-cards" id="performerCards"></div>
+  </div>
+
+  <div class="panel full-span">
+    <h2>Team Formation — average position this match</h2>
+    <canvas id="formation" width="900" height="450"></canvas>
   </div>
 
   <div class="panel full-span">
@@ -196,14 +274,26 @@
           <th>Team</th>
           <th>Distance (m)</th>
           <th>Top Speed (km/h)</th>
+          <th>Avg Speed (km/h)</th>
+          <th>Sprints</th>
           <th>Passes</th>
           <th>Shots</th>
         </tr>
       </thead>
       <tbody id="playersBody">
-        <tr><td colspan="6" class="empty-state">No player stats yet</td></tr>
+        <tr><td colspan="8" class="empty-state">No player stats yet</td></tr>
       </tbody>
     </table>
+  </div>
+
+  <div class="panel">
+    <h2>Team Comparison</h2>
+    <div id="teamComparison"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Attacking Zones</h2>
+    <div id="attackingZones"></div>
   </div>
 
   <div class="panel full-span">
@@ -266,6 +356,10 @@ async function loadMatch(matchId) {
   renderHeader(match, stats);
   renderEvents(events);
   renderPlayers(stats);
+  renderTopPerformers(stats);
+  renderTeamComparison(stats);
+  renderAttackingZones(stats);
+  drawFormation(stats);
 
   // Auto-select the top player's heatmap
   if (stats && stats.player_stats.length > 0) {
@@ -288,6 +382,18 @@ function renderHeader(match, stats) {
   document.getElementById("possAwayBar").style.width = `${stats.away_possession_pct}%`;
   document.getElementById("possHomeLabel").textContent = `HOME possession ${stats.home_possession_pct}%`;
   document.getElementById("possAwayLabel").textContent = `AWAY possession ${stats.away_possession_pct}%`;
+
+  const xgRow = document.getElementById("xgRow");
+  const homeXg = (stats.home_xg || 0).toFixed(2);
+  const awayXg = (stats.away_xg || 0).toFixed(2);
+  const estBadge = (title) => `<span class="est-badge" title="${title}">est.</span>`;
+  const xgTitle = "Estimated from shot distance/angle using an illustrative logistic formula - not an officially calibrated xG model";
+  const cornersTitle = "Detected heuristically from ball-tracking gaps reappearing near a pitch corner - approximate, not a direct measurement";
+  xgRow.innerHTML = `
+    <span>xG${estBadge(xgTitle)} <span class="val">${homeXg}</span></span>
+    <span>Corners${estBadge(cornersTitle)} <span class="val">${stats.home_corners || 0} - ${stats.away_corners || 0}</span></span>
+    <span>xG${estBadge(xgTitle)} <span class="val">${awayXg}</span></span>
+  `;
 }
 
 function renderEvents(events) {
@@ -296,19 +402,25 @@ function renderEvents(events) {
     list.innerHTML = `<div class="empty-state">No discrete goal/pass events detected in this clip window</div>`;
     return;
   }
-  list.innerHTML = events.slice().reverse().map(e => `
+  list.innerHTML = events.slice().reverse().map(e => {
+    const xg = e.event_type === "SHOT" && e.data_json && typeof e.data_json.xg === "number"
+      ? `<span class="event-xg">xG ${e.data_json.xg.toFixed(2)}</span>`
+      : "";
+    return `
     <div class="event-row">
       <span class="event-time">${fmtTime(e.timestamp_ms)}</span>
       <span class="event-type ${e.event_type}">${e.event_type.replace("_", " ")}</span>
       <span>${e.team || ""}</span>
+      ${xg}
     </div>
-  `).join("");
+  `;
+  }).join("");
 }
 
 function renderPlayers(stats) {
   const body = document.getElementById("playersBody");
   if (!stats || stats.player_stats.length === 0) {
-    body.innerHTML = `<tr><td colspan="6" class="empty-state">No player stats yet</td></tr>`;
+    body.innerHTML = `<tr><td colspan="8" class="empty-state">No player stats yet</td></tr>`;
     return;
   }
   const sorted = [...stats.player_stats].sort((a, b) => b.distance_m - a.distance_m);
@@ -318,6 +430,8 @@ function renderPlayers(stats) {
       <td><span class="team-dot ${p.team || "UNASSIGNED"}"></span>${p.team || "-"}</td>
       <td>${p.distance_m.toFixed(1)}</td>
       <td>${p.top_speed_kmh.toFixed(1)}</td>
+      <td>${(p.avg_speed_kmh || 0).toFixed(1)}</td>
+      <td>${p.sprints || 0}</td>
       <td>${p.passes}</td>
       <td>${p.shots}</td>
     </tr>
@@ -330,6 +444,169 @@ function renderPlayers(stats) {
       body.querySelectorAll("tr").forEach(r => r.classList.remove("selected"));
       row.classList.add("selected");
     });
+  });
+}
+
+function renderTopPerformers(stats) {
+  const el = document.getElementById("performerCards");
+  const players = stats ? stats.player_stats : [];
+  if (!players.length) {
+    el.innerHTML = `<div class="empty-state">No player stats yet</div>`;
+    return;
+  }
+
+  const byMetric = (key) => [...players].sort((a, b) => b[key] - a[key])[0];
+  const fastest = byMetric("top_speed_kmh");
+  const mostDistance = byMetric("distance_m");
+  const mostPasses = byMetric("passes");
+  // Simple composite "player of the match" score - distance + passes + shots, each
+  // weighted so no single stat dominates purely by scale.
+  const motm = [...players].sort((a, b) =>
+    (b.distance_m * 0.02 + b.passes * 1.5 + b.shots * 3) -
+    (a.distance_m * 0.02 + a.passes * 1.5 + a.shots * 3)
+  )[0];
+
+  const card = (label, p, value, unit) => `
+    <div class="performer-card">
+      <div class="label">${label}</div>
+      <div class="name"><span class="team-dot ${p.team || "UNASSIGNED"}"></span>${p.player_name || "Player"}</div>
+      <div class="metric">${value}<span class="unit">${unit}</span></div>
+    </div>`;
+
+  el.innerHTML = [
+    card("Player of the Match", motm, "★", ""),
+    card("Fastest Sprint", fastest, fastest.top_speed_kmh.toFixed(1), "km/h"),
+    card("Most Distance", mostDistance, mostDistance.distance_m.toFixed(0), "m"),
+    card("Most Passes", mostPasses, mostPasses.passes, ""),
+  ].join("");
+}
+
+function renderTeamComparison(stats) {
+  const el = document.getElementById("teamComparison");
+  const players = stats ? stats.player_stats : [];
+  if (!players.length) {
+    el.innerHTML = `<div class="empty-state">No player stats yet</div>`;
+    return;
+  }
+
+  const home = players.filter(p => p.team === "HOME");
+  const away = players.filter(p => p.team === "AWAY");
+  const sum = (arr, key) => arr.reduce((acc, p) => acc + (p[key] || 0), 0);
+
+  const estBadge = (title) => `<span class="est-badge" title="${title}">est.</span>`;
+  const metrics = [
+    { label: "Possession %", home: stats.home_possession_pct, away: stats.away_possession_pct },
+    { label: `xG${estBadge("Estimated from shot distance/angle using an illustrative logistic formula - not an officially calibrated xG model")}`, home: (stats.home_xg || 0).toFixed(2), away: (stats.away_xg || 0).toFixed(2) },
+    { label: `Shots${estBadge("Detected heuristically from ball speed/direction toward goal - can miscount hard clearances or long balls as shots")}`, home: sum(home, "shots"), away: sum(away, "shots") },
+    { label: `Corners${estBadge("Detected heuristically from ball-tracking gaps reappearing near a pitch corner - approximate, not a direct measurement")}`, home: stats.home_corners || 0, away: stats.away_corners || 0 },
+    { label: "Distance (m)", home: Math.round(sum(home, "distance_m")), away: Math.round(sum(away, "distance_m")) },
+    { label: "Passes", home: sum(home, "passes"), away: sum(away, "passes") },
+    { label: "Sprints", home: sum(home, "sprints"), away: sum(away, "sprints") },
+  ];
+
+  el.innerHTML = metrics.map(m => `
+    <div class="compare-row">
+      <div class="home-cell"><span class="compare-pill home">${m.home}</span></div>
+      <div class="metric-label">${m.label}</div>
+      <div class="away-cell"><span class="compare-pill away">${m.away}</span></div>
+    </div>
+  `).join("");
+}
+
+function renderAttackingZones(stats) {
+  const el = document.getElementById("attackingZones");
+  const zt = stats ? stats.zone_touches : null;
+  if (!zt || !zt.HOME || !zt.AWAY) {
+    el.innerHTML = `<div class="empty-state">No zone data yet</div>`;
+    return;
+  }
+
+  const zones = [
+    { key: "ATTACKING", label: "Attacking 3rd" },
+    { key: "MIDDLE", label: "Middle 3rd" },
+    { key: "DEFENSIVE", label: "Defensive 3rd" },
+  ];
+
+  el.innerHTML = zones.map(z => {
+    // Show each team's share of ITS OWN attacking-third touches vs the other
+    // team's touches in the mirrored zone (their defensive 3rd is this team's
+    // attacking 3rd), so the bar reads as "who controls this area of the pitch".
+    const homeVal = zt.HOME[z.key] || 0;
+    const awayVal = zt.AWAY[z.key === "ATTACKING" ? "DEFENSIVE" : z.key === "DEFENSIVE" ? "ATTACKING" : "MIDDLE"] || 0;
+    const total = homeVal + awayVal;
+    const homePct = total > 0 ? (homeVal / total) * 100 : 50;
+    return `
+      <div class="zone-row">
+        <div class="zone-label">${z.label}</div>
+        <div class="zone-bar-track">
+          <div class="home-fill" style="width:${homePct}%">${total > 0 ? Math.round(homePct) + "%" : ""}</div>
+          <div class="away-fill" style="width:${100 - homePct}%">${total > 0 ? Math.round(100 - homePct) + "%" : ""}</div>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+// A player's heatmap grid is already a normalized 2D occupancy matrix - its
+// weighted centroid is a good, backend-free estimate of "where this player
+// spent most of the match", which is exactly what a formation view needs.
+function avgPositionFromHeatmap(grid) {
+  if (!grid || grid.length === 0) return null;
+  const rows = grid.length, cols = grid[0].length;
+  let sumX = 0, sumY = 0, sumW = 0;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const w = grid[r][c];
+      if (w <= 0) continue;
+      sumX += (c + 0.5) * w;
+      sumY += (r + 0.5) * w;
+      sumW += w;
+    }
+  }
+  if (sumW === 0) return null;
+  return { xFrac: sumX / sumW / cols, yFrac: sumY / sumW / rows };
+}
+
+function drawFormation(stats) {
+  const canvas = document.getElementById("formation");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  ctx.fillStyle = "#0e1b12";
+  ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = "#2c4c34";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(8, 8, W - 16, H - 16);
+  ctx.beginPath();
+  ctx.moveTo(W / 2, 8);
+  ctx.lineTo(W / 2, H - 8);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(W / 2, H / 2, 45, 0, Math.PI * 2);
+  ctx.stroke();
+
+  const players = stats ? stats.player_stats : [];
+  players.forEach(p => {
+    const pos = avgPositionFromHeatmap(p.heatmap_json);
+    if (!pos) return;
+    const x = 8 + pos.xFrac * (W - 16);
+    const y = 8 + pos.yFrac * (H - 16);
+    const color = p.team === "HOME" ? "#4f9bff" : p.team === "AWAY" ? "#ff6b6b" : "#7d8b99";
+
+    ctx.beginPath();
+    ctx.arc(x, y, 12, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.strokeStyle = "#0b0f14";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.fillStyle = "#0b0f14";
+    ctx.font = "bold 10px -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(p.jersey_number ?? "?", x, y);
   });
 }
 
