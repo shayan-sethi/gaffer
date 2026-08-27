@@ -16,6 +16,14 @@ class TrackedObject:
         self.history: List[Tuple[int, Tuple[float, float]]] = [(frame_no, centroid)]  # (frame_no, centroid)
         self.consecutive_lost = 0
         self.team: str = "UNASSIGNED"  # HOME, AWAY, REFEREE
+        # Once True, _assign_teams leaves .team alone - a real player doesn't
+        # switch sides mid-match, so once a track has been confidently labeled
+        # (by color clustering or the position fallback), later periodic
+        # re-clusters must not be able to flip it. Before this, a track's label
+        # could drift across a cluster boundary (lighting/shadow/exposure
+        # changes) and silently misattribute goals/shots/possession to the
+        # wrong team mid-match.
+        self.team_locked: bool = False
         self.total_distance_px: float = 0.0
         self.color_samples: List[Tuple[float, float, float]] = []  # accumulated mean BGR jersey samples
         self.appearance_hist: Optional[np.ndarray] = None  # EMA'd re-ID descriptor (see CentroidTracker._appearance_descriptor)
@@ -176,12 +184,45 @@ class CentroidTracker:
         bc = np.sum(np.sqrt(np.clip(a, 0, None) * np.clip(b, 0, None)))
         return float(np.sqrt(max(0.0, 1.0 - bc)))
 
-    def _try_reid_match(self, descriptor: Optional[np.ndarray]) -> Optional[TrackedObject]:
-        """Looks for a lost player whose appearance most closely matches a new detection."""
+    # Rough cap on how far a player can plausibly have moved since being lost,
+    # in pixels/frame-unit. Measured actual player motion in this footage
+    # (frame-to-frame centroid deltas): median 4.45, p90 13.46, p99 28.17
+    # px/frame-unit. The budget needs real margin above that - the "predicted"
+    # position is a straight-line extrapolation of last known velocity, which
+    # diverges fast from a player who changes direction, slows, or stops during
+    # the miss - so this is set well above the measured p99 rather than close
+    # to it; a tight budget mostly rejects correct matches (and previously
+    # made fragmentation worse, not better - see git history), while the
+    # appearance histogram is what actually discriminates between candidates.
+    REID_MAX_PX_PER_FRAME = 60.0
+    REID_MAX_PX_ABSOLUTE = 1200.0
+
+    def _try_reid_match(
+        self, descriptor: Optional[np.ndarray], centroid: Tuple[float, float], frame_no: int
+    ) -> Optional[TrackedObject]:
+        """
+        Looks for a lost player whose appearance most closely matches a new detection.
+        Appearance (jersey-color histogram) alone can't disambiguate teammates - two
+        players on the same side look near-identical by color, so pure appearance
+        matching was misassigning a reappearing player to whichever lost teammate's
+        histogram happened to be closest, or missing the match and spawning a new
+        track ID (the main driver of track-count fragmentation). Gating candidates by
+        plausible position first - projecting each lost track's last known motion
+        forward through however many frames it's been missing - means only players
+        who could actually be at this spot are even considered before appearance
+        breaks the tie.
+        """
         if descriptor is None or not self.lost_gallery:
             return None
         best_id, best_dist = None, self.reid_max_distance
         for t_id, t in self.lost_gallery.items():
+            elapsed = max(1, frame_no - (t.lost_at_frame or frame_no))
+            damp = 0.85
+            factor = sum(damp ** i for i in range(elapsed))
+            predicted = (t.centroid[0] + t.velocity[0] * factor, t.centroid[1] + t.velocity[1] * factor)
+            max_dist_px = min(self.REID_MAX_PX_ABSOLUTE, self.REID_MAX_PX_PER_FRAME * elapsed)
+            if math.hypot(centroid[0] - predicted[0], centroid[1] - predicted[1]) > max_dist_px:
+                continue
             dist = self._hist_distance(descriptor, t.appearance_hist)
             if dist < best_dist:
                 best_dist = dist
@@ -250,13 +291,40 @@ class CentroidTracker:
                 t.mark_lost()
             return []
 
-        best_det = max(ball_dets, key=lambda d: d.confidence)
-        centroid = self._get_centroid(best_det.bbox, "ball")
-
         if ball_tracks:
             t = next(iter(ball_tracks.values()))
+            # Only accept a detection consistent with the ball's own trajectory -
+            # a real ball can't teleport across the pitch in a single processed
+            # frame. Budget scales with how long it's been missing (a real gap
+            # does allow real movement), so this self-widens to accept any
+            # detection once the gap is long enough to plausibly be anywhere -
+            # no separate "just trust the best one" fallback needed, since that
+            # fallback is exactly what let a same-frame false positive (crowd,
+            # advertising board, floodlight) hijack the track every time real
+            # ball recall missed the actual ball that frame.
+            predicted = t.predicted_centroid()
+            # Capped rather than growing forever: a genuinely long absence (many
+            # seconds) should recover via full track expiry + a fresh trusted
+            # first-sighting (see below), not by this same track's jump budget
+            # eventually becoming "anywhere in the frame is plausible."
+            max_jump = min(700.0, 140.0 * (t.consecutive_lost + 1))
+            candidates = [
+                d for d in ball_dets
+                if math.hypot(*(np.subtract(self._get_centroid(d.bbox, "ball"), predicted))) <= max_jump
+            ]
+            if not candidates:
+                t.mark_lost()
+                return []
+
+            best_det = max(candidates, key=lambda d: d.confidence)
+            centroid = self._get_centroid(best_det.bbox, "ball")
             t.update(best_det.bbox, centroid, frame_no)
             return [t]
+
+        # First sighting (or the previous track already expired) - no trajectory to
+        # judge candidates against yet, so just trust the most confident detection.
+        best_det = max(ball_dets, key=lambda d: d.confidence)
+        centroid = self._get_centroid(best_det.bbox, "ball")
 
         track = TrackedObject(
             track_id=self.next_track_id,
@@ -284,7 +352,7 @@ class CentroidTracker:
         def spawn_or_revive(det: DetectionResult, centroid: Tuple[float, float]) -> TrackedObject:
             color = self._sample_color(frame, det.bbox) if det.class_name == "player" else None
             descriptor = self._appearance_descriptor(frame, det.bbox) if try_reid else None
-            revived = self._try_reid_match(descriptor) if try_reid else None
+            revived = self._try_reid_match(descriptor, centroid, frame_no) if try_reid else None
             if revived is not None:
                 revived.update(det.bbox, centroid, frame_no, color_sample=color, appearance_descriptor=descriptor)
                 self.tracks[revived.track_id] = revived
@@ -369,6 +437,9 @@ class CentroidTracker:
         Assigns HOME / AWAY teams to player tracks by clustering jersey color (KMeans, k=2).
         Position-based splitting breaks the moment players cross the pitch, so color is the
         primary signal; tracks without enough color samples yet fall back to a position split.
+        A track's team is locked the first time it's assigned - re-clustering only fills in
+        still-unlocked tracks from here on, it never revises an already-decided one (a real
+        player doesn't change sides mid-match; see TrackedObject.team_locked).
         """
         players = [t for t in self.tracks.values() if t.class_name == "player"]
         if len(players) < 2:
@@ -395,14 +466,20 @@ class CentroidTracker:
                         labels = 1 - labels
                 self._team_reference_centroids = centroids
                 for p, label in zip(with_color, labels):
+                    if p.team_locked:
+                        continue
                     p.team = "HOME" if label == 0 else "AWAY"
+                    p.team_locked = True
             except Exception:
                 pass
 
         # Players without a stable color signal yet (new tracks) fall back to spatial split
-        remaining = [p for p in players if p.team == "UNASSIGNED"]
+        remaining = [p for p in players if not p.team_locked]
         if remaining:
             x_coords = [p.centroid[0] for p in players]
             median_x = np.median(x_coords)
             for p in remaining:
                 p.team = "HOME" if p.centroid[0] < median_x else "AWAY"
+                # Not locked yet - this is a low-confidence fallback (no color signal),
+                # so let it keep being revised until real color samples accumulate and
+                # the block above locks it in properly.

@@ -49,6 +49,19 @@ class PitchMask:
         mask = cv2.dilate(mask, np.ones((7, 7), np.uint8))
         return mask
 
+    def bounding_box(self) -> Optional[tuple]:
+        """(x_min, y_min, x_max, y_max) of the segmented pitch region, or None if
+        segmentation wasn't confident. Used to place goal zones relative to where
+        the pitch actually sits in frame, rather than assuming it fills the frame
+        edge-to-edge (wide/fixed cameras usually show crowd, boards, or run-off
+        space beyond the touchlines)."""
+        if self.mask is None:
+            return None
+        ys, xs = np.where(self.mask > 0)
+        if len(xs) == 0:
+            return None
+        return (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+
     def contains_point(self, x: float, y: float) -> bool:
         if self.mask is None:
             return True  # Segmentation wasn't confident - don't filter anything

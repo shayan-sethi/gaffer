@@ -58,7 +58,14 @@ def track_players_task(self, match_id: str, s3_url: str = None) -> Dict[str, Any
             allow_fallback_on_empty=is_synthetic_source,
             img_size=settings.YOLO_IMG_SIZE,
         )
-        tracker = CentroidTracker(max_lost_frames=45, max_distance_px=90.0)
+        # reid_gallery_max_age is in real video frame units (frame_no keeps counting
+        # every frame even though we only process every `sampled_rate`-th one). At a
+        # typical 24-30fps this needs to be large - a match-length window, not a
+        # few-second one - since a player can be occluded, off-camera, or briefly
+        # subbed for minutes and should still be recognized as the same person when
+        # they reappear rather than minted as a new track. 18000 frames is ~12.5
+        # minutes at 24fps.
+        tracker = CentroidTracker(max_lost_frames=45, max_distance_px=90.0, reid_gallery_max_age=18000)
 
         frame_no = 0
         all_detections_batch: List[Detection] = []
@@ -90,6 +97,17 @@ def track_players_task(self, match_id: str, s3_url: str = None) -> Dict[str, Any
             if pitch_mask is None or pitch_mask.mask is None:
                 # Keep retrying (e.g. past intro/title cards) until segmentation succeeds, then lock it in
                 pitch_mask = PitchMask(frame)
+                pitch_bbox = pitch_mask.bounding_box()
+                if pitch_bbox is not None:
+                    px1, py1, px2, py2 = pitch_bbox
+                    # Generous padding (not the tight grass contour) - a real ball
+                    # legitimately leaves the grass mask at goal-mouths, corners, and
+                    # throw-ins. This is only meant to reject detections clearly off
+                    # in the crowd/stands, not to clip real goal/boundary play.
+                    pad_x, pad_y = (px2 - px1) * 0.15, (py2 - py1) * 0.25
+                    ball_bounds = (px1 - pad_x, py1 - pad_y, px2 + pad_x, py2 + pad_y)
+                else:
+                    ball_bounds = None
 
             # Detect objects (players and ball)
             detections = detector.detect_frame(frame)
@@ -102,13 +120,28 @@ def track_players_task(self, match_id: str, s3_url: str = None) -> Dict[str, Any
                 if d.class_name != "player" or pitch_mask.contains_point((d.bbox[0] + d.bbox[2]) / 2.0, d.bbox[3])
             ]
 
+            # Same idea for the ball, but padded generously (see above) - a tiled
+            # low-confidence false positive up in the crowd/stands is exactly what
+            # was hijacking the ball track and firing fake goal events.
+            if ball_bounds is not None:
+                bx1, by1, bx2, by2 = ball_bounds
+                detections = [
+                    d for d in detections
+                    if d.class_name != "ball" or (
+                        bx1 <= (d.bbox[0] + d.bbox[2]) / 2.0 <= bx2
+                        and by1 <= (d.bbox[1] + d.bbox[3]) / 2.0 <= by2
+                    )
+                ]
+
             # A single full-frame pass essentially never finds the ball on real broadcast-
             # distance footage - it's too small/low-contrast. Tiled ball-only detection
-            # trades extra inference passes for enough effective resolution to see it.
-            # Skip this on the synthetic demo canvas: the fallback already places a
-            # simulated ball there, and there's no real ball to tile-search for.
-            if not is_synthetic_source:
-                detections = [d for d in detections if d.class_name != "ball"]
+            # trades extra inference passes (4x by default) for enough effective
+            # resolution to see it - but that's only needed when the cheap full-frame
+            # pass actually missed it. Skip this on the synthetic demo canvas: the
+            # fallback already places a simulated ball there, and there's no real ball
+            # to tile-search for.
+            main_pass_found_ball = any(d.class_name == "ball" for d in detections)
+            if not is_synthetic_source and not main_pass_found_ball:
                 detections += detector.detect_ball_tiled(frame)
 
             # Update tracker (frame passed through for jersey-color team assignment)
@@ -191,6 +224,7 @@ def track_players_task(self, match_id: str, s3_url: str = None) -> Dict[str, Any
             "fps": fps,
             "frame_width": width,
             "frame_height": height,
+            "pitch_bounds": list(pitch_mask.bounding_box()) if pitch_mask and pitch_mask.mask is not None else None,
             "tracks": serializable_tracks,
         }
 

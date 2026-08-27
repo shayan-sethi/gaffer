@@ -30,6 +30,7 @@ wheels/
 
 # Temporary / storage
 /tmp/
+/.local_data/
 storage/
 *.mp4
 *.avi
