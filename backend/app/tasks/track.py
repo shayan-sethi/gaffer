@@ -34,6 +34,12 @@ def track_players_task(self, match_id: str, s3_url: str = None) -> Dict[str, Any
         match.status = MatchStatus.PROCESSING
         db.commit()
 
+        # Carried through to the events/stats tasks so they can build a
+        # homography-corrected PitchCalibration instead of the linear
+        # pixel-to-meter approximation, if this fixed camera has been
+        # calibrated (see app.cv.calibration.PitchCalibration).
+        calibration_points = match.camera.calibration_points if match.camera else None
+
         video_url = s3_url or match.video_s3_url or "synthetic"
         is_synthetic_source = video_url == "synthetic" or video_url.startswith("mock://")
         local_video_path = os.path.join(settings.STORAGE_LOCAL_DIR, f"{match_id}.mp4")
@@ -225,6 +231,7 @@ def track_players_task(self, match_id: str, s3_url: str = None) -> Dict[str, Any
             "frame_width": width,
             "frame_height": height,
             "pitch_bounds": list(pitch_mask.bounding_box()) if pitch_mask and pitch_mask.mask is not None else None,
+            "calibration_points": calibration_points,
             "tracks": serializable_tracks,
         }
 

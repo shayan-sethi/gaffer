@@ -1,5 +1,6 @@
 import bisect
 import logging
+import math
 from typing import Dict, Any, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
@@ -8,6 +9,7 @@ from app.db.database import SessionLocal
 from app.db.models import Match, Event, Player
 from app.cv.events import EventDetector, DetectedEvent
 from app.cv.tracker import TrackedObject
+from app.cv.calibration import PitchCalibration
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,10 @@ def _detect_corners(
     frame_height: int,
     fps: float,
     max_gap_ball: int,
+    calibration: Optional[PitchCalibration] = None,
+    pitch_length_m: float = 40.0,
+    pitch_width_m: float = 20.0,
+    corner_radius_m: float = 3.0,
 ) -> List[DetectedEvent]:
     """
     Approximate corner-kick detection: the ball is genuinely undetected for a
@@ -72,19 +78,39 @@ def _detect_corners(
         px1, py1, px2, py2 = pitch_bounds
     else:
         px1, py1, px2, py2 = 0, 0, frame_width, frame_height
-    pitch_w = max(1, px2 - px1)
-    pitch_h = max(1, py2 - py1)
-    x_margin = pitch_w * 0.08
-    y_margin = pitch_h * 0.12
 
-    def attacking_team_for_corner(x: float, y: float) -> Optional[str]:
-        near_left, near_right = x <= px1 + x_margin, x >= px2 - x_margin
-        near_top, near_bottom = y <= py1 + y_margin, y >= py2 - y_margin
-        if (near_left or near_right) and (near_top or near_bottom):
-            # Same left/right attacking convention as GOAL/zone checks: HOME
-            # attacks the right side, so a corner won there is HOME's.
-            return "HOME" if near_right else "AWAY"
-        return None
+    if calibration is not None:
+        # A real, fixed-radius corner region in meters - unlike the pixel-
+        # fraction fallback below, this is the same real size regardless of
+        # whether that corner sits near the camera (large in pixels) or far
+        # from it (small in pixels), the same perspective distortion
+        # PitchCalibration corrects for distance/speed.
+        world_corners = {
+            "AWAY": [(0.0, 0.0), (0.0, pitch_width_m)],   # AWAY attacks LEFT (low x)
+            "HOME": [(pitch_length_m, 0.0), (pitch_length_m, pitch_width_m)],  # HOME attacks RIGHT
+        }
+
+        def attacking_team_for_corner(x: float, y: float) -> Optional[str]:
+            wx, wy = calibration.pixel_to_world_m(x, y)
+            for team, corners in world_corners.items():
+                for cx, cy in corners:
+                    if math.hypot(wx - cx, wy - cy) <= corner_radius_m:
+                        return team
+            return None
+    else:
+        pitch_w = max(1, px2 - px1)
+        pitch_h = max(1, py2 - py1)
+        x_margin = pitch_w * 0.08
+        y_margin = pitch_h * 0.12
+
+        def attacking_team_for_corner(x: float, y: float) -> Optional[str]:
+            near_left, near_right = x <= px1 + x_margin, x >= px2 - x_margin
+            near_top, near_bottom = y <= py1 + y_margin, y >= py2 - y_margin
+            if (near_left or near_right) and (near_top or near_bottom):
+                # Same left/right attacking convention as GOAL/zone checks: HOME
+                # attacks the right side, so a corner won there is HOME's.
+                return "HOME" if near_right else "AWAY"
+            return None
 
     events: List[DetectedEvent] = []
     last_corner_frame = -int(fps * 8)
@@ -165,12 +191,17 @@ def detect_events_task(self, tracking_payload: Dict[str, Any]) -> Dict[str, Any]
             for p in db.query(Player).filter(Player.match_id == match_id).all()
         }
 
+        calibration = PitchCalibration.from_points_json(
+            tracking_payload.get("calibration_points"), pitch_length_m=40.0, pitch_width_m=20.0
+        )
+
         # Initialize detector
         event_detector = EventDetector(
             frame_width=width,
             frame_height=height,
             fps=fps,
             pitch_bounds=tuple(pitch_bounds) if pitch_bounds else None,
+            calibration=calibration,
         )
 
         # Simulate frame-by-frame processing for events
@@ -220,6 +251,7 @@ def detect_events_task(self, tracking_payload: Dict[str, Any]) -> Dict[str, Any]
                 track_positions[ball_track_id],
                 tuple(pitch_bounds) if pitch_bounds else None,
                 width, height, fps, max_gap_ball,
+                calibration=calibration,
             )
             for e in corner_events:
                 detected_events_orm.append(Event(

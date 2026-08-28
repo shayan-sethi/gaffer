@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 from app.cv.tracker import TrackedObject
 from app.cv.events import DetectedEvent
+from app.cv.calibration import PitchCalibration
 
 
 class StatsCalculator:
@@ -23,9 +24,14 @@ class StatsCalculator:
         fps: float = 30.0,
         pitch_px_width: Optional[float] = None,
         pitch_px_height: Optional[float] = None,
+        calibration: Optional[PitchCalibration] = None,
     ):
         self.pitch_length_m = pitch_length_m
         self.pitch_width_m = pitch_width_m
+        # When a real per-camera homography is available, it replaces the flat
+        # px_to_m_x/y ratio below for every distance/speed measurement - see
+        # PitchCalibration for why the linear ratio is only an approximation.
+        self.calibration = calibration
         # frame_width/frame_height are the raw video frame's pixel dimensions -
         # positions/history are stored in that coordinate space, so the heatmap
         # grid (which buckets raw positions into cells) must normalize against
@@ -90,9 +96,12 @@ class StatsCalculator:
             f_prev, (x1, y1) = history[i - 1]
             f_curr, (x2, y2) = history[i]
 
-            dx_m = (x2 - x1) * self.px_to_m_x
-            dy_m = (y2 - y1) * self.px_to_m_y
-            dist_m = math.hypot(dx_m, dy_m)
+            if self.calibration is not None:
+                dist_m = self.calibration.distance_m((x1, y1), (x2, y2))
+            else:
+                dx_m = (x2 - x1) * self.px_to_m_x
+                dy_m = (y2 - y1) * self.px_to_m_y
+                dist_m = math.hypot(dx_m, dy_m)
             total_distance_m += dist_m
 
             frame_diff = f_curr - f_prev

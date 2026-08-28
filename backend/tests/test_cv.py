@@ -1,8 +1,12 @@
+import cv2
 import numpy as np
+import pytest
 from app.cv.detector import YOLOv8Detector, DetectionResult
 from app.cv.tracker import CentroidTracker, TrackedObject
 from app.cv.events import EventDetector
 from app.cv.stats import StatsCalculator
+from app.cv.calibration import PitchCalibration
+from app.tasks.events import _detect_corners
 
 
 def test_yolo_detector_real_empty_frame_stays_empty():
@@ -94,3 +98,316 @@ def test_stats_calculator_heatmaps_and_distance():
     assert metrics["top_speed_kmh"] > 0.0
     assert len(metrics["heatmap_json"]) == 20  # 20 rows
     assert len(metrics["heatmap_json"][0]) == 30  # 30 cols
+
+
+def _history_from_deltas(start_frame, start_pos, deltas):
+    # deltas: list of (dx_px, dy_px) applied one per frame step.
+    history = [(start_frame, start_pos)]
+    frame_no, (x, y) = start_frame, start_pos
+    for dx, dy in deltas:
+        frame_no += 1
+        x, y = x + dx, y + dy
+        history.append((frame_no, (x, y)))
+    return history
+
+
+def test_stats_calculator_single_point_history_returns_zeroed_stats():
+    calc = StatsCalculator(pitch_length_m=40.0, pitch_width_m=20.0, frame_width=1280, frame_height=720, fps=30.0)
+    player = TrackedObject(1, "player", [100, 100, 140, 180], (120, 180), 1)
+
+    metrics = calc.compute_player_stats(player, events=[], total_frames=1)
+
+    assert metrics["distance_m"] == 0.0
+    assert metrics["top_speed_kmh"] == 0.0
+    assert metrics["avg_speed_kmh"] == 0.0
+    assert metrics["sprints"] == 0
+
+
+def test_stats_calculator_avg_speed_matches_top_speed_at_constant_pace():
+    calc = StatsCalculator(pitch_length_m=40.0, pitch_width_m=20.0, frame_width=1280, frame_height=720, fps=30.0)
+    player = TrackedObject(1, "player", [100, 100, 140, 180], (100.0, 200.0), 1)
+    # 2px/frame at 30fps, px_to_m_x = 40/1280 -> a steady ~6.75 km/h jog.
+    player.history = _history_from_deltas(1, (100.0, 200.0), [(2.0, 0.0)] * 20)
+
+    metrics = calc.compute_player_stats(player, events=[], total_frames=21)
+
+    assert metrics["top_speed_kmh"] == metrics["avg_speed_kmh"]
+    assert metrics["top_speed_kmh"] == pytest.approx(6.75)
+    assert metrics["sprints"] == 0
+
+
+def test_stats_calculator_counts_distinct_sustained_sprints():
+    calc = StatsCalculator(pitch_length_m=40.0, pitch_width_m=20.0, frame_width=1280, frame_height=720, fps=30.0)
+    player = TrackedObject(1, "player", [100, 100, 140, 180], (100.0, 200.0), 1)
+
+    # Jog (~6.75 km/h, below the 20 km/h sprint-enter threshold) ...
+    jog = [(2.0, 0.0)] * 5
+    # ... then a sustained fast burst (~27 km/h, well over 0.8s) - one sprint ...
+    burst = [(8.0, 0.0)] * 26
+    # ... back to a jog (drops below the 15 km/h exit threshold, ending the sprint) ...
+    # ... then a second sustained burst - a second, distinct sprint.
+    player.history = _history_from_deltas(1, (100.0, 200.0), jog + burst + jog + burst)
+
+    metrics = calc.compute_player_stats(player, events=[], total_frames=len(player.history))
+
+    assert metrics["sprints"] == 2
+    assert metrics["top_speed_kmh"] == pytest.approx(27.0)
+    # Weighted average of the jog and burst speeds - strictly between the two.
+    assert 6.75 < metrics["avg_speed_kmh"] < 27.0
+
+
+def test_stats_calculator_sprint_below_min_duration_does_not_count():
+    calc = StatsCalculator(pitch_length_m=40.0, pitch_width_m=20.0, frame_width=1280, frame_height=720, fps=30.0)
+    player = TrackedObject(1, "player", [100, 100, 140, 180], (100.0, 200.0), 1)
+
+    # Fast burst (~27 km/h) for only 5 frames (~0.167s) - under the 0.8s minimum
+    # sustained duration, so it must not register as a sprint.
+    jog = [(2.0, 0.0)] * 5
+    short_burst = [(8.0, 0.0)] * 5
+    player.history = _history_from_deltas(1, (100.0, 200.0), jog + short_burst + jog)
+
+    metrics = calc.compute_player_stats(player, events=[], total_frames=len(player.history))
+
+    assert metrics["sprints"] == 0
+
+
+def test_stats_calculator_teleport_artifact_excluded_from_speed_stats():
+    calc = StatsCalculator(pitch_length_m=40.0, pitch_width_m=20.0, frame_width=1280, frame_height=720, fps=30.0)
+    player = TrackedObject(1, "player", [100, 100, 140, 180], (100.0, 200.0), 1)
+
+    # A single-frame 800px jump (~360 km/h, a detection/Re-ID glitch) sandwiched
+    # between realistic jogging speed - must be filtered out of top/avg speed,
+    # not treated as the player's real top speed.
+    jog = [(2.0, 0.0)] * 5
+    teleport = [(800.0, 0.0)]
+    player.history = _history_from_deltas(1, (100.0, 200.0), jog + teleport + jog)
+
+    metrics = calc.compute_player_stats(player, events=[], total_frames=len(player.history))
+
+    assert metrics["top_speed_kmh"] < 35.0
+
+
+def test_compute_xg_decreases_with_distance_and_angle():
+    detector = EventDetector(frame_width=1280, frame_height=720, fps=30.0)
+
+    close_central = detector._compute_xg(distance_m=5.0, angle_deg=0.0)
+    far_central = detector._compute_xg(distance_m=25.0, angle_deg=0.0)
+    close_wide = detector._compute_xg(distance_m=5.0, angle_deg=40.0)
+
+    assert 0.0 < far_central < close_central < 1.0
+    assert close_wide < close_central
+
+
+def test_shot_event_carries_a_plausible_xg():
+    detector = EventDetector(frame_width=1280, frame_height=720, fps=30.0)
+
+    home_player = TrackedObject(1, "player", [980, 340, 1020, 380], (1000.0, 360.0), 1)
+    home_player.team = "HOME"
+    ball_at_player = TrackedObject(99, "ball", [990, 350, 1010, 370], (1000.0, 360.0), 1)
+    # Establishes HOME as the last possessor before the ball is struck.
+    detector.process_frame([home_player, ball_at_player], frame_no=1)
+
+    # 10 frames later (0.33s, inside the shot-velocity window) the ball is deep
+    # in the box dead in front of goal, moving fast and straight at it.
+    ball_struck = TrackedObject(99, "ball", [1190, 350, 1210, 370], (1200.0, 360.0), 11)
+    events = detector.process_frame([home_player, ball_struck], frame_no=11)
+
+    shot_evts = [e for e in events if e.event_type == "SHOT"]
+    assert len(shot_evts) == 1
+    assert shot_evts[0].team == "HOME"
+    xg = shot_evts[0].data_json["xg"]
+    # Point-blank, dead-central shot - xG should be high, not a token nonzero value.
+    assert 0.7 < xg <= 1.0
+
+
+def test_zone_touches_attributed_by_each_teams_attacking_direction():
+    # HOME attacks the RIGHT (high-x) goal, AWAY attacks the LEFT (low-x) goal -
+    # so the same raw ball x-position is a different zone for each team.
+    detector = EventDetector(frame_width=1200, frame_height=600, fps=30.0, pitch_bounds=(0, 0, 1200, 600))
+
+    def touch(track_id, team, x, frame_no):
+        player = TrackedObject(track_id, "player", [x - 20, 530, x + 20, 570], (float(x), 550.0), frame_no)
+        player.team = team
+        ball = TrackedObject(99, "ball", [x - 10, 545, x + 10, 555], (float(x), 550.0), frame_no)
+        detector.process_frame([player, ball], frame_no=frame_no)
+
+    touch(1, "HOME", 100, 1)    # HOME's own defensive third
+    touch(1, "HOME", 600, 101)  # midfield
+    touch(1, "HOME", 1000, 201)  # HOME's attacking third
+    touch(2, "AWAY", 1000, 301)  # AWAY's own defensive third (mirrored)
+    touch(2, "AWAY", 100, 401)   # AWAY's attacking third (mirrored)
+
+    assert detector.zone_touches["HOME"] == {"DEFENSIVE": 1, "MIDDLE": 1, "ATTACKING": 1}
+    assert detector.zone_touches["AWAY"] == {"DEFENSIVE": 1, "MIDDLE": 0, "ATTACKING": 1}
+
+
+def test_detect_corners_attributes_team_by_pitch_side():
+    pitch_bounds = (0, 0, 1200, 600)
+
+    # Ball goes undetected for a real stoppage (gap 190 >> max_gap_ball 15) then
+    # reappears pinned in the top-right corner - HOME attacks right, so it's HOME's.
+    events = _detect_corners(
+        ball_sorted_frames=[10, 200],
+        ball_positions={10: (600.0, 300.0), 200: (1150.0, 50.0)},
+        pitch_bounds=pitch_bounds,
+        frame_width=1200,
+        frame_height=600,
+        fps=30.0,
+        max_gap_ball=15,
+    )
+
+    assert len(events) == 1
+    assert events[0].event_type == "CORNER"
+    assert events[0].team == "HOME"
+    assert events[0].frame_no == 200
+
+
+def test_detect_corners_ignores_stoppages_away_from_a_corner():
+    events = _detect_corners(
+        ball_sorted_frames=[10, 200],
+        ball_positions={10: (600.0, 300.0), 200: (600.0, 300.0)},  # reappears mid-pitch
+        pitch_bounds=(0, 0, 1200, 600),
+        frame_width=1200,
+        frame_height=600,
+        fps=30.0,
+        max_gap_ball=15,
+    )
+
+    assert events == []
+
+
+def test_detect_corners_ignores_ordinary_sampling_gaps():
+    events = _detect_corners(
+        ball_sorted_frames=[10, 20],  # gap of 10, under max_gap_ball
+        ball_positions={10: (600.0, 300.0), 20: (1150.0, 50.0)},
+        pitch_bounds=(0, 0, 1200, 600),
+        frame_width=1200,
+        frame_height=600,
+        fps=30.0,
+        max_gap_ball=15,
+    )
+
+    assert events == []
+
+
+# A trapezoid modeling a real fixed, angled camera (same geometry as
+# test_calibration.py): the near touchline (large y) spans far more pixels
+# than the far touchline (small y) for the same 40m real-world length.
+_CALIB_TL, _CALIB_TR, _CALIB_BR, _CALIB_BL = (400.0, 100.0), (880.0, 100.0), (1230.0, 650.0), (50.0, 650.0)
+
+
+def _far_touchline_calibration():
+    return PitchCalibration([_CALIB_TL, _CALIB_TR, _CALIB_BR, _CALIB_BL], pitch_length_m=40.0, pitch_width_m=20.0)
+
+
+def test_stats_calculator_calibration_fixes_the_linear_approximations_skew():
+    player = TrackedObject(1, "player", [0, 0, 0, 0], _CALIB_TL, 1)
+    # A run entirely along the far (narrow-in-pixels) touchline, between the
+    # two far corners - a real, known ~480px move worth exactly 40m.
+    player.history = [(1, _CALIB_TL), (2, _CALIB_TR)]
+
+    calibrated = StatsCalculator(
+        pitch_length_m=40.0, pitch_width_m=20.0, frame_width=1280, frame_height=720,
+        fps=30.0, calibration=_far_touchline_calibration(),
+    )
+    # The old behavior: a flat ratio derived from the pitch's overall bounding
+    # box (as tasks/stats.py builds it from the pitch mask), which - because
+    # the near touchline is wider - understates real distance for play that
+    # happens up near the far touchline.
+    uncalibrated = StatsCalculator(
+        pitch_length_m=40.0, pitch_width_m=20.0, frame_width=1280, frame_height=720, fps=30.0,
+        pitch_px_width=_CALIB_BR[0] - _CALIB_BL[0], pitch_px_height=_CALIB_BL[1] - _CALIB_TL[1],
+    )
+
+    calibrated_metrics = calibrated.compute_player_stats(player, events=[], total_frames=2)
+    uncalibrated_metrics = uncalibrated.compute_player_stats(player, events=[], total_frames=2)
+
+    assert calibrated_metrics["distance_m"] == pytest.approx(40.0, abs=0.5)
+    # The uncalibrated figure is off by a wide margin - not a rounding difference.
+    assert uncalibrated_metrics["distance_m"] < 30.0
+
+
+def test_event_detector_to_world_m_uses_calibration_when_set():
+    calibration = _far_touchline_calibration()
+    detector = EventDetector(frame_width=1280, frame_height=720, fps=30.0, calibration=calibration)
+
+    assert detector._to_world_m(*_CALIB_TR) == pytest.approx(calibration.pixel_to_world_m(*_CALIB_TR), abs=1e-6)
+    # And it must actually be routing through calibration, not silently
+    # falling back to the linear approximation alongside it.
+    fallback_x = (_CALIB_TR[0] - detector.pitch_x1) * detector.px_to_m_x
+    assert detector._to_world_m(*_CALIB_TR)[0] != pytest.approx(fallback_x, abs=0.5)
+
+
+def _forward_project_far_touchline(x_m, y_m):
+    world = np.array([[0.0, 0.0], [40.0, 0.0], [40.0, 20.0], [0.0, 20.0]], dtype=np.float32)
+    image = np.array([_CALIB_TL, _CALIB_TR, _CALIB_BR, _CALIB_BL], dtype=np.float32)
+    h = cv2.getPerspectiveTransform(world, image)
+    pt = np.array([[[x_m, y_m]]], dtype=np.float32)
+    px = cv2.perspectiveTransform(pt, h)
+    return float(px[0, 0, 0]), float(px[0, 0, 1])
+
+
+def test_detect_corners_with_calibration_attributes_by_real_world_proximity():
+    calibration = _far_touchline_calibration()
+    # 2.7m from the AWAY (0,0) corner in real terms - clearly "a corner", even
+    # though it sits at the far/narrow-in-pixels end of the pitch.
+    reappear_px = _forward_project_far_touchline(2.0, 1.8)
+
+    events = _detect_corners(
+        ball_sorted_frames=[10, 200],
+        ball_positions={10: (700.0, 350.0), 200: reappear_px},
+        pitch_bounds=None,
+        frame_width=1280, frame_height=720, fps=30.0, max_gap_ball=15,
+        calibration=calibration,
+    )
+
+    assert len(events) == 1
+    assert events[0].team == "AWAY"
+
+
+def test_detect_corners_with_calibration_ignores_points_far_from_any_corner():
+    calibration = _far_touchline_calibration()
+    midfield_px = _forward_project_far_touchline(20.0, 10.0)
+
+    events = _detect_corners(
+        ball_sorted_frames=[10, 200],
+        ball_positions={10: (700.0, 350.0), 200: midfield_px},
+        pitch_bounds=None,
+        frame_width=1280, frame_height=720, fps=30.0, max_gap_ball=15,
+        calibration=calibration,
+    )
+
+    assert events == []
+
+
+def test_detect_corners_calibration_catches_a_far_corner_the_pixel_fraction_heuristic_misses():
+    calibration = _far_touchline_calibration()
+    # 1.4m from the far AWAY corner (0,0) - unambiguously "at the corner" in
+    # real-world terms.
+    reappear_px = _forward_project_far_touchline(1.0, 1.0)
+
+    calibrated_events = _detect_corners(
+        ball_sorted_frames=[10, 200],
+        ball_positions={10: (700.0, 350.0), 200: reappear_px},
+        pitch_bounds=None, frame_width=1280, frame_height=720, fps=30.0, max_gap_ball=15,
+        calibration=calibration,
+    )
+
+    # The pixel-fraction fallback, using the trapezoid's own bounding box: an
+    # 8% margin of the *whole* bbox width barely reaches into the narrow far
+    # end, so this same real-world corner point isn't "near the edge" in
+    # pixel terms there - exactly the perspective distortion calibration fixes.
+    pitch_bounds = (
+        int(min(_CALIB_TL[0], _CALIB_BL[0])), int(min(_CALIB_TL[1], _CALIB_TR[1])),
+        int(max(_CALIB_TR[0], _CALIB_BR[0])), int(max(_CALIB_BL[1], _CALIB_BR[1])),
+    )
+    uncalibrated_events = _detect_corners(
+        ball_sorted_frames=[10, 200],
+        ball_positions={10: (700.0, 350.0), 200: reappear_px},
+        pitch_bounds=pitch_bounds, frame_width=1280, frame_height=720, fps=30.0, max_gap_ball=15,
+        calibration=None,
+    )
+
+    assert len(calibrated_events) == 1
+    assert calibrated_events[0].team == "AWAY"
+    assert uncalibrated_events == []

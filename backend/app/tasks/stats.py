@@ -9,6 +9,7 @@ from app.db.models import Match, MatchStatus, Player, PlayerStat, Event
 from app.cv.stats import StatsCalculator
 from app.cv.tracker import TrackedObject
 from app.cv.events import DetectedEvent
+from app.cv.calibration import PitchCalibration
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,10 @@ def aggregate_stats_task(self, event_payload: Dict[str, Any]) -> Dict[str, Any]:
             pitch_px_width = None
             pitch_px_height = None
 
+        calibration = PitchCalibration.from_points_json(
+            event_payload.get("calibration_points"), pitch_length_m=40.0, pitch_width_m=20.0
+        )
+
         stats_calc = StatsCalculator(
             pitch_length_m=40.0,
             pitch_width_m=20.0,
@@ -88,6 +93,7 @@ def aggregate_stats_task(self, event_payload: Dict[str, Any]) -> Dict[str, Any]:
             fps=fps,
             pitch_px_width=pitch_px_width,
             pitch_px_height=pitch_px_height,
+            calibration=calibration,
         )
 
         # Map players

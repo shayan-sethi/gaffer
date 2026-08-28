@@ -6,9 +6,10 @@ from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.db.models import Camera, CameraStatus, Match, MatchStatus
-from app.schemas.camera import CameraRegisterRequest, CameraHeartbeatRequest, CameraResponse
+from app.schemas.camera import CameraRegisterRequest, CameraHeartbeatRequest, CameraResponse, CameraCalibrationRequest
 from app.schemas.match import StartMatchRequest, UploadCompleteRequest, MatchResponse
 from app.tasks.pipeline import trigger_match_pipeline
+from app.cv.calibration import PitchCalibration
 
 router = APIRouter(prefix="/cameras", tags=["Cameras"])
 
@@ -69,6 +70,29 @@ def get_camera(camera_id: str, db: Session = Depends(get_db)):
     camera = db.query(Camera).filter(Camera.id == camera_id).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
+    return camera
+
+
+@router.put("/{camera_id}/calibration", response_model=CameraResponse)
+def set_camera_calibration(camera_id: str, payload: CameraCalibrationRequest, db: Session = Depends(get_db)):
+    """
+    Operator marks the 4 pitch corners (TL, TR, BR, BL) on a reference frame
+    from this fixed camera, once per install. Powers homography-corrected
+    distance/speed/xG instead of the flat pixel-to-meter approximation - see
+    PitchCalibration.
+    """
+    camera = db.query(Camera).filter(Camera.id == camera_id).first()
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    try:
+        PitchCalibration(payload.points, pitch_length_m=40.0, pitch_width_m=20.0)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=f"Invalid calibration points: {e}")
+
+    camera.calibration_points = [list(p) for p in payload.points]
+    db.commit()
+    db.refresh(camera)
     return camera
 
 

@@ -1,6 +1,7 @@
 import math
 from typing import List, Dict, Any, Optional, Tuple
 from app.cv.tracker import TrackedObject
+from app.cv.calibration import PitchCalibration
 
 
 class DetectedEvent:
@@ -70,12 +71,17 @@ class EventDetector:
         pitch_bounds: Optional[Tuple[int, int, int, int]] = None,
         pitch_length_m: float = 40.0,
         pitch_width_m: float = 20.0,
+        calibration: Optional[PitchCalibration] = None,
     ):
         self.width = frame_width
         self.height = frame_height
         self.fps = fps
         self.pitch_length_m = pitch_length_m
         self.pitch_width_m = pitch_width_m
+        # See PitchCalibration - when set, shot distance/speed/angle are computed
+        # via the real per-camera homography instead of the linear px_to_m
+        # fallback below.
+        self.calibration = calibration
 
         # Goal zones sit just inside where the pitch actually starts/ends in frame,
         # not the raw frame edges - a fixed/wide camera usually shows crowd, boards,
@@ -150,6 +156,17 @@ class EventDetector:
         self.last_shot_frame: int = -int(fps * self.SHOT_COOLDOWN_SEC)
 
         self.events: List[DetectedEvent] = []
+
+    def _to_world_m(self, x: float, y: float) -> Tuple[float, float]:
+        """
+        Pixel -> real-world pitch meters, via the real per-camera homography if
+        calibrated, otherwise the linear px_to_m_x/y approximation (offset from
+        the pitch's top-left so that two such points still difference out to the
+        same delta the old code computed directly on raw pixels).
+        """
+        if self.calibration is not None:
+            return self.calibration.pixel_to_world_m(x, y)
+        return ((x - self.pitch_x1) * self.px_to_m_x, (y - self.pitch_y1) * self.px_to_m_y)
 
     def _compute_xg(self, distance_m: float, angle_deg: float) -> float:
         """
@@ -304,8 +321,9 @@ class EventDetector:
 
             if frame_diff >= min_gap:
                 if frame_diff <= max_gap:
-                    dx_m = (bx - self._last_ball_pos[0]) * self.px_to_m_x
-                    dy_m = (by - self._last_ball_pos[1]) * self.px_to_m_y
+                    prev_wx, prev_wy = self._to_world_m(*self._last_ball_pos)
+                    curr_wx, curr_wy = self._to_world_m(bx, by)
+                    dx_m, dy_m = curr_wx - prev_wx, curr_wy - prev_wy
                     vel_dist_m = math.hypot(dx_m, dy_m)
                     speed_kmh = (vel_dist_m / (frame_diff / self.fps)) * 3.6
 
@@ -321,8 +339,8 @@ class EventDetector:
                         and speed_kmh >= self.SHOT_SPEED_KMH
                         and (frame_no - self.last_shot_frame) > (self.fps * self.SHOT_COOLDOWN_SEC)
                     ):
-                        to_goal_x_m = (target_goal[0] - bx) * self.px_to_m_x
-                        to_goal_y_m = (target_goal[1] - by) * self.px_to_m_y
+                        goal_wx, goal_wy = self._to_world_m(*target_goal)
+                        to_goal_x_m, to_goal_y_m = goal_wx - curr_wx, goal_wy - curr_wy
                         to_goal_dist_m = math.hypot(to_goal_x_m, to_goal_y_m)
 
                         cos_sim = (

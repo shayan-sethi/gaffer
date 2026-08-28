@@ -44,6 +44,13 @@ class Camera(Base):
     ip_address = Column(String(50), nullable=True)
     firmware_version = Column(String(50), default="1.0.0")
     last_heartbeat = Column(DateTime, nullable=True)
+    # 4 pixel points [[x,y], ...] marking the pitch corners in a reference frame,
+    # in TL, TR, BR, BL order (matching the pitch_x=0/pitch_y=0 top-left
+    # convention used throughout the CV pipeline) - set once per fixed camera
+    # install so distance/speed can be computed via a real perspective
+    # correction instead of a flat pixel-to-meter ratio. Null until an operator
+    # calibrates the camera.
+    calibration_points = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
