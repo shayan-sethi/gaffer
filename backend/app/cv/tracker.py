@@ -15,6 +15,10 @@ class TrackedObject:
         self.velocity: Tuple[float, float] = (0.0, 0.0)  # smoothed per-frame (dx, dy), used to predict through misses
         self.history: List[Tuple[int, Tuple[float, float]]] = [(frame_no, centroid)]  # (frame_no, centroid)
         self.consecutive_lost = 0
+        # Real successful matches (the initial spawn counts as 1, .update() counts
+        # the rest) - see CentroidTracker.CONFIRM_HITS for why a track needs more
+        # than 1 before it's allowed into the re-ID gallery.
+        self.hits = 1
         self.team: str = "UNASSIGNED"  # HOME, AWAY, REFEREE
         # Once True, _assign_teams leaves .team alone - a real player doesn't
         # switch sides mid-match, so once a track has been confidently labeled
@@ -69,6 +73,7 @@ class TrackedObject:
         self.history.append((frame_no, centroid))
         self.consecutive_lost = 0
         self.lost_at_frame = None
+        self.hits += 1
         if color_sample is not None:
             self.color_samples.append(color_sample)
         if appearance_descriptor is not None:
@@ -197,6 +202,19 @@ class CentroidTracker:
     REID_MAX_PX_PER_FRAME = 60.0
     REID_MAX_PX_ABSOLUTE = 1200.0
 
+    # A track needs at least one real second sighting (not just its initial
+    # spawn) before it's allowed into the re-ID gallery. Found on production
+    # footage: a single-frame detector false positive (a bright line/reflection
+    # misread as a "player") spawned a track that never matched again - but
+    # still sat in the gallery for hundreds of frames, well within
+    # REID_MAX_PX_ABSOLUTE's reach, until it was "found" and merged with a
+    # completely unrelated real player's trajectory later in the match. A real
+    # player is matched again within a frame or two almost always; something
+    # that never gets a second hit before expiring is far more likely a one-off
+    # artifact than a real person who happened to vanish instantly, so it isn't
+    # worth keeping around as re-ID bait.
+    CONFIRM_HITS = 2
+
     def _try_reid_match(
         self, descriptor: Optional[np.ndarray], centroid: Tuple[float, float], frame_no: int
     ) -> Optional[TrackedObject]:
@@ -258,9 +276,11 @@ class CentroidTracker:
         ]
         for t_id in expired_ids:
             t = self.tracks.pop(t_id)
-            if t.class_name == "player" and t.appearance_hist is not None:
+            if t.class_name == "player" and t.appearance_hist is not None and t.hits >= self.CONFIRM_HITS:
                 t.lost_at_frame = frame_no
                 self.lost_gallery[t_id] = t
+            # else: never confirmed by a second real sighting - dropped outright
+            # rather than kept as re-ID bait (see CONFIRM_HITS).
 
         # 3b. Permanently drop gallery entries that have been unmatched for too long
         stale_gallery_ids = [

@@ -104,6 +104,44 @@ def test_centroid_tracker_isolated_track_does_not_poison_nearby_matches():
     assert len(tracker.tracks) == 4
 
 
+def test_centroid_tracker_unconfirmed_track_is_not_kept_as_reid_bait():
+    # Regression test for a real bug found on production footage: a single-
+    # frame detector false positive (a bright line/reflection misread as a
+    # "player") spawned a track that never matched again, yet it still sat in
+    # the re-ID gallery for hundreds of frames - long enough to later be
+    # "found" and merged with a completely unrelated real player's trajectory,
+    # corrupting that player's whole subsequent stats. A track that never gets
+    # a second real sighting before expiring must be dropped outright, not
+    # preserved as a re-ID candidate.
+    tracker = CentroidTracker(max_lost_frames=5, max_distance_px=50.0, reid_gallery_max_age=1000)
+    # A uniform-color synthetic frame - every crop produces the same jersey-
+    # color histogram, so if the ghost track *were* still in the gallery, a
+    # later detection would trivially "match" it by appearance (distance ~0).
+    frame = np.full((400, 400, 3), (60, 60, 60), dtype=np.uint8)
+
+    ghost_det = [DetectionResult("player", [50, 50, 90, 150], 0.9, 0)]
+    active = tracker.update(ghost_det, frame_no=1, frame=frame)
+    ghost_id = active[0].track_id
+    assert tracker.tracks[ghost_id].hits == 1
+
+    # Never seen again - goes lost every frame until it expires.
+    for f in range(2, 10):
+        tracker.update([], frame_no=f, frame=frame)
+    assert ghost_id not in tracker.tracks
+    # The real fix: it must not have been preserved for future re-ID either.
+    assert ghost_id not in tracker.lost_gallery
+
+    # A detection appears elsewhere nearby (well within re-ID distance budget)
+    # with an identical appearance signature - if the ghost were still in the
+    # gallery, this would incorrectly revive/merge into it.
+    new_det = [DetectionResult("player", [150, 150, 190, 250], 0.9, 0)]
+    active2 = tracker.update(new_det, frame_no=15, frame=frame)
+
+    assert len(active2) == 1
+    assert active2[0].track_id != ghost_id
+    assert active2[0].hits == 1
+
+
 def test_event_detector_and_goals():
     event_detector = EventDetector(frame_width=1280, frame_height=720, fps=30.0)
 
