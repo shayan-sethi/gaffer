@@ -397,7 +397,20 @@ class CentroidTracker:
             for j, dc in enumerate(det_centroids):
                 cost_matrix[i, j] = math.hypot(tc[0] - dc[0], tc[1] - dc[1])
 
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        # Gate implausible pairs to a large sentinel *before* solving, not just
+        # filtered out after. Hungarian minimizes the GLOBAL sum, so a single
+        # isolated track with no real candidate nearby (e.g. a player far from
+        # everyone else, genuinely occluded/missed that frame) would otherwise
+        # get assigned whatever detection is "least bad" for it - and since that
+        # reassignment can ripple through the whole matrix, it can bump two
+        # completely unrelated, genuinely-adjacent tracks off their own excellent
+        # (sub-30px) matches onto equally-implausible ones, so all three end up
+        # rejected and re-spawned as brand new IDs instead of just the one that
+        # actually had no match. A sentinel cost (versus real, always-smaller
+        # distances) can never be worth "trading into" a nearby track's good
+        # match, so it can't contaminate assignments outside its own row/column.
+        gated_cost_matrix = np.where(cost_matrix > max_distance, 1e6, cost_matrix)
+        row_ind, col_ind = linear_sum_assignment(gated_cost_matrix)
 
         assigned_rows = set()
         assigned_cols = set()

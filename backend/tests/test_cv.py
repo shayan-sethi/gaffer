@@ -61,6 +61,49 @@ def test_centroid_tracker():
     assert track_ids_1 == track_ids_2
 
 
+def test_centroid_tracker_isolated_track_does_not_poison_nearby_matches():
+    # Regression test for a real bug found on production footage: Hungarian
+    # assignment on a raw (ungated) distance cost matrix can force an isolated
+    # track with no plausible candidate to "steal" whatever detection is least
+    # bad for it, and because Hungarian minimizes the GLOBAL cost sum, that
+    # cascades into two completely unrelated, genuinely-adjacent tracks losing
+    # their own excellent (sub-25px) matches to the same phantom competition -
+    # so all three get rejected as unmatched and re-spawned as brand new IDs,
+    # instead of just the one that actually had no match. Numbers below are a
+    # simplified, exact reproduction of the real failure (see tracker.py).
+    tracker = CentroidTracker(max_lost_frames=30, max_distance_px=90.0)
+
+    dets_f1 = [
+        DetectionResult("player", [650, 350, 690, 410], 0.9, 0),  # "A"
+        DetectionResult("player", [355, 295, 395, 355], 0.9, 0),  # "B"
+        DetectionResult("player", [30, 340, 70, 400], 0.9, 0),    # "C" - isolated
+    ]
+    active_1 = tracker.update(dets_f1, frame_no=1)
+    assert len(active_1) == 3
+    by_centroid = {t.centroid: t.track_id for t in active_1}
+    id_a = by_centroid[(670.0, 410.0)]
+    id_b = by_centroid[(375.0, 355.0)]
+
+    # Next frame: A and B move a small, plausible amount. C's detection is
+    # genuinely missing this frame (occluded/missed) - the third detection
+    # here is unrelated and far from all three tracks, not a match for anyone.
+    dets_f2 = [
+        DetectionResult("player", [635, 345, 675, 405], 0.9, 0),  # near A
+        DetectionResult("player", [330, 300, 370, 360], 0.9, 0),  # near B
+        DetectionResult("player", [810, 260, 850, 320], 0.9, 0),  # far from everyone
+    ]
+    active_2 = tracker.update(dets_f2, frame_no=2)
+    active_ids_2 = {t.track_id for t in active_2}
+
+    # A and B had an unambiguous, well-within-threshold match this frame and
+    # must keep their original IDs - C being unmatchable is not their problem.
+    assert id_a in active_ids_2
+    assert id_b in active_ids_2
+    # Exactly one new track spawned (for the leftover far detection) - not
+    # three, which is what the bug produced.
+    assert len(tracker.tracks) == 4
+
+
 def test_event_detector_and_goals():
     event_detector = EventDetector(frame_width=1280, frame_height=720, fps=30.0)
 
