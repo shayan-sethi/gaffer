@@ -76,7 +76,15 @@ def track_players_task(self, match_id: str, s3_url: str = None) -> Dict[str, Any
         frame_no = 0
         all_detections_batch: List[Detection] = []
         sampled_rate = 2  # Process every 2nd frame for speed/efficiency while maintaining tracks
-        pitch_mask: PitchMask = None  # Computed lazily from the first frame (camera is fixed all match)
+        # Re-detected every processed frame, not computed once and locked in - the
+        # camera pans/zooms to follow the ball rather than staying static, so a
+        # mask locked to wherever the pitch sat in an early frame would silently
+        # start letting sideline spectators/bystanders count as "players" (or
+        # clipping real ones) the moment the camera moves. Cheap enough (~8ms vs
+        # ~50ms of YOLO inference per frame) that recomputing it every frame costs
+        # far less than the correctness it buys.
+        pitch_mask: PitchMask = None
+        last_valid_bbox: tuple = None  # falls back to this on a frame segmentation fails for
 
         max_limit = int(os.getenv("MAX_FRAMES", "0"))
         effective_total = min(total_frames, max_limit) if max_limit > 0 else total_frames
@@ -100,20 +108,28 @@ def track_players_task(self, match_id: str, s3_url: str = None) -> Dict[str, Any
 
             timestamp_ms = int((frame_no / fps) * 1000)
 
-            if pitch_mask is None or pitch_mask.mask is None:
-                # Keep retrying (e.g. past intro/title cards) until segmentation succeeds, then lock it in
-                pitch_mask = PitchMask(frame)
-                pitch_bbox = pitch_mask.bounding_box()
-                if pitch_bbox is not None:
-                    px1, py1, px2, py2 = pitch_bbox
-                    # Generous padding (not the tight grass contour) - a real ball
-                    # legitimately leaves the grass mask at goal-mouths, corners, and
-                    # throw-ins. This is only meant to reject detections clearly off
-                    # in the crowd/stands, not to clip real goal/boundary play.
-                    pad_x, pad_y = (px2 - px1) * 0.15, (py2 - py1) * 0.25
-                    ball_bounds = (px1 - pad_x, py1 - pad_y, px2 + pad_x, py2 + pad_y)
-                else:
-                    ball_bounds = None
+            pitch_mask = PitchMask(frame)
+            pitch_bbox = pitch_mask.bounding_box()
+            if pitch_bbox is None and last_valid_bbox is not None:
+                # A single frame's segmentation can fail transiently (fast zoom,
+                # motion blur, a glare) even mid-pan when the pitch is genuinely
+                # still in frame - reuse the last confident detection for this one
+                # frame rather than disabling ROI filtering entirely and letting
+                # every bystander through.
+                pitch_bbox = last_valid_bbox
+            elif pitch_bbox is not None:
+                last_valid_bbox = pitch_bbox
+
+            if pitch_bbox is not None:
+                px1, py1, px2, py2 = pitch_bbox
+                # Generous padding (not the tight grass contour) - a real ball
+                # legitimately leaves the grass mask at goal-mouths, corners, and
+                # throw-ins. This is only meant to reject detections clearly off
+                # in the crowd/stands, not to clip real goal/boundary play.
+                pad_x, pad_y = (px2 - px1) * 0.15, (py2 - py1) * 0.25
+                ball_bounds = (px1 - pad_x, py1 - pad_y, px2 + pad_x, py2 + pad_y)
+            else:
+                ball_bounds = None
 
             # Detect objects (players and ball)
             detections = detector.detect_frame(frame)
@@ -230,7 +246,13 @@ def track_players_task(self, match_id: str, s3_url: str = None) -> Dict[str, Any
             "fps": fps,
             "frame_width": width,
             "frame_height": height,
-            "pitch_bounds": list(pitch_mask.bounding_box()) if pitch_mask and pitch_mask.mask is not None else None,
+            # Last frame's pitch region - a static snapshot even though the mask
+            # itself was tracked live throughout (see the per-frame recompute
+            # above). Downstream event/stats zone math (goals, corners, thirds,
+            # linear speed scaling) still assumes one fixed pitch position for
+            # the whole match; that's a separate, larger gap a panning camera
+            # exposes, not fixed by live-tracking the ROI mask alone.
+            "pitch_bounds": list(last_valid_bbox) if last_valid_bbox is not None else None,
             "calibration_points": calibration_points,
             "tracks": serializable_tracks,
         }
