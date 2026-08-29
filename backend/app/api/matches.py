@@ -1,13 +1,17 @@
+import os
 from typing import List, Optional
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+import cv2
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Response
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db.database import get_db
 from app.db.models import Match, MatchStatus, Player, Detection
 from app.schemas.match import MatchResponse, MatchDetailResponse, TriggerProcessRequest
 from app.schemas.detection import DetectionResponse
 from app.tasks.pipeline import trigger_match_pipeline
+from app.tasks.ingest import download_match_video
 
 router = APIRouter(prefix="/matches", tags=["Matches"])
 
@@ -95,6 +99,53 @@ def trigger_process_match(
         "task_id": str(task_id),
         "message": "Match processing pipeline started.",
     }
+
+
+@router.get("/{match_id}/reference_frame")
+def get_reference_frame(match_id: str, db: Session = Depends(get_db)):
+    """
+    A single representative JPEG frame from this match's video, for an
+    operator to mark pitch corners against when calibrating this match's
+    camera (see PUT /api/cameras/{id}/calibration). Decoded on demand, not
+    stored - reuses the video already downloaded locally by the tracking
+    task if present, since re-fetching a full video from S3 just to grab one
+    frame would otherwise happen on every calibration attempt.
+    """
+    match = db.query(Match).filter(Match.id == match_id).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    local_path = os.path.join(settings.STORAGE_LOCAL_DIR, f"{match_id}.mp4")
+    if not os.path.exists(local_path):
+        try:
+            download_match_video(match.video_s3_url or "synthetic", local_path)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Could not load match video: {e}")
+
+    cap = cv2.VideoCapture(local_path)
+    if not cap.isOpened():
+        raise HTTPException(status_code=502, detail="Could not open match video")
+
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        # A couple of seconds in - past any intro/title card, still well within
+        # a short clip - same "camera is fixed all match" assumption PitchMask
+        # relies on, so any in-play frame works equally well for calibration.
+        target_frame = min(total_frames - 1, int(fps * 2))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        ok, frame = cap.read()
+    finally:
+        cap.release()
+
+    if not ok:
+        raise HTTPException(status_code=502, detail="Could not decode a reference frame from the video")
+
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to encode reference frame")
+
+    return Response(content=buf.tobytes(), media_type="image/jpeg")
 
 
 @router.get("/{match_id}/detections", response_model=List[DetectionResponse])

@@ -70,6 +70,23 @@ def test_match_lifecycle(client):
     assert "player_stats" in stats_data
 
 
+def test_match_reference_frame_returns_a_jpeg(client):
+    create_res = client.post("/api/matches", params={"title": "Calibration Reference Test"})
+    match_id = create_res.json()["id"]
+
+    res = client.get(f"/api/matches/{match_id}/reference_frame")
+
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "image/jpeg"
+    assert len(res.content) > 0
+    assert res.content[:2] == b"\xff\xd8"  # JPEG magic bytes
+
+
+def test_match_reference_frame_unknown_match_404(client):
+    res = client.get("/api/matches/does-not-exist/reference_frame")
+    assert res.status_code == 404
+
+
 def test_camera_calibration(client):
     reg_res = client.post("/api/cameras/register", json={
         "serial_number": "TEST-CAM-CALIB-003",
