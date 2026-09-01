@@ -44,6 +44,16 @@ class EventDetector:
 
     # Shot detection / xG tuning.
     SHOT_SPEED_KMH = 55.0  # comfortably above typical pass/dribble/clearance speed
+    # No real football shot exceeds this by any meaningful margin (the fastest
+    # officially recorded shot is ~131 km/h, by a professional) - found on
+    # production footage that most computed "shots" were 140-165 km/h, an order
+    # of magnitude beyond anything a real strike produces. That's ball-tracking
+    # noise (the single "ball" track briefly snapping onto a spurious detection
+    # elsewhere in frame - a false positive, or a second real ball/object -
+    # rather than following the real ball), not a fast shot, and needs an upper
+    # bound the same way player speed already has one (see StatsCalculator's
+    # 35 km/h filter) - SHOT_SPEED_KMH alone only sets a floor.
+    SHOT_MAX_SPEED_KMH = 120.0
     SHOT_MAX_DIST_FRAC = 0.4  # only count as a shot if launched from within this
     # fraction of the pitch length to the target goal - filters out hopeful long
     # balls/clearances upfield that happen to be fast and vaguely goal-ward.
@@ -336,7 +346,7 @@ class EventDetector:
 
                     if (
                         target_goal is not None
-                        and speed_kmh >= self.SHOT_SPEED_KMH
+                        and self.SHOT_SPEED_KMH <= speed_kmh <= self.SHOT_MAX_SPEED_KMH
                         and (frame_no - self.last_shot_frame) > (self.fps * self.SHOT_COOLDOWN_SEC)
                     ):
                         goal_wx, goal_wy = self._to_world_m(*target_goal)

@@ -301,6 +301,30 @@ def test_shot_event_carries_a_plausible_xg():
     assert 0.7 < xg <= 1.0
 
 
+def test_shot_with_implausible_speed_is_rejected_as_tracking_noise():
+    # Regression test for a real bug found on production footage: most
+    # detected "shots" were computed at 140-165 km/h, far beyond any real
+    # football shot (the fastest officially recorded is ~131 km/h, by a
+    # professional). That's the ball track briefly snapping onto a spurious
+    # detection elsewhere in frame (noise, or a second ball/object) rather
+    # than following the real ball - not a fast strike - and must be rejected.
+    detector = EventDetector(frame_width=1280, frame_height=720, fps=30.0)
+
+    home_player = TrackedObject(1, "player", [980, 340, 1020, 380], (1000.0, 360.0), 1)
+    home_player.team = "HOME"
+    ball_at_player = TrackedObject(99, "ball", [990, 350, 1010, 370], (1000.0, 360.0), 1)
+    detector.process_frame([home_player, ball_at_player], frame_no=1)
+
+    # Same end position/direction/timing as the real shot above, but starting
+    # much farther away in the same 10-frame window - implying ~1400 km/h.
+    detector._last_ball_pos = (-3000.0, 360.0)
+    detector._last_ball_frame = 1
+    ball_teleported = TrackedObject(99, "ball", [1190, 350, 1210, 370], (1200.0, 360.0), 11)
+    events = detector.process_frame([home_player, ball_teleported], frame_no=11)
+
+    assert [e for e in events if e.event_type == "SHOT"] == []
+
+
 def test_zone_touches_attributed_by_each_teams_attacking_direction():
     # HOME attacks the RIGHT (high-x) goal, AWAY attacks the LEFT (low-x) goal -
     # so the same raw ball x-position is a different zone for each team.
