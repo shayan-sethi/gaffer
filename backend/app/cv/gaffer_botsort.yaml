@@ -1,0 +1,25 @@
+# Ultralytics BoT-SORT defaults (see ultralytics/cfg/trackers/botsort.yaml),
+# tuned for this project's footage: track_buffer raised from the 30-call
+# default to 450. Confirmed on real production footage that with the default,
+# BoT-SORT gave up on a lost player (camera pan, brief occlusion, player
+# leaving/re-entering frame) far more readily than this project's own
+# CentroidTracker - 204 player track IDs over a 10-minute clip that should
+# have ~12-14 real players, vs 17-18 with CentroidTracker on the same window.
+# A much longer buffer gives BoT-SORT's own motion model more chances to
+# re-associate a real reappearing player via IoU/motion alone before this
+# project falls back to minting a brand new identity for them.
+
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 450
+match_thresh: 0.8
+fuse_score: True
+
+gmc_method: sparseOptFlow
+
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: False
+model: auto

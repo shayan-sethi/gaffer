@@ -149,7 +149,7 @@ class YOLOv8Detector:
             # drawn shapes) - supplement with simulation there only, never on real footage.
             if len(detections) == 0 and self.allow_fallback_on_empty:
                 return self._fallback_detect(frame)
-            return detections
+            return self._dedup_overlapping_player_detections(detections)
         except Exception as e:
             logger.error(f"Inference error with YOLOv8: {e}")
             if self.allow_fallback_on_empty:
@@ -237,6 +237,36 @@ class YOLOv8Detector:
                 kept.append(d)
         return kept
 
+    # Confirmed on real production footage: an awkward pose (an arm raised mid-
+    # header/reach) occasionally makes the model output a second, smaller, lower-
+    # confidence box nested almost entirely inside the real one - e.g. just the
+    # raised arm/shoulder read as its own "player". These two boxes are such
+    # different sizes that their IoU is small (measured ~0.13 on the real case),
+    # so the model's own NMS (which gates on IoU) doesn't merge them - but 96% of
+    # the smaller box's own area sits inside the larger one, which is what actually
+    # identifies "these are the same detection", not IoU. Left undeduped, the
+    # tracker matched both to separate tracks with conflicting team labels.
+    PLAYER_CONTAINMENT_DEDUP_THRESHOLD = 0.85
+
+    def _dedup_overlapping_player_detections(self, detections: List[DetectionResult]) -> List[DetectionResult]:
+        """Drops a lower-confidence 'player' detection that's almost entirely contained within a
+        higher-confidence one (see PLAYER_CONTAINMENT_DEDUP_THRESHOLD). Ball detections pass through
+        untouched - there's only ever one ball, and its own tracking already handles duplicates."""
+        players = [d for d in detections if d.class_name == "player"]
+        others = [d for d in detections if d.class_name != "player"]
+        if len(players) <= 1:
+            return detections
+
+        players = sorted(players, key=lambda d: d.confidence, reverse=True)
+        kept: List[DetectionResult] = []
+        for d in players:
+            if not any(
+                self._containment_ratio(d.bbox, k.bbox) > self.PLAYER_CONTAINMENT_DEDUP_THRESHOLD
+                for k in kept
+            ):
+                kept.append(d)
+        return others + kept
+
     @staticmethod
     def _iou(a: List[float], b: List[float]) -> float:
         ax1, ay1, ax2, ay2 = a
@@ -248,6 +278,20 @@ class YOLOv8Detector:
         area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
         union = area_a + area_b - inter
         return inter / union if union > 0 else 0.0
+
+    @staticmethod
+    def _containment_ratio(a: List[float], b: List[float]) -> float:
+        """Fraction of the SMALLER box's own area that overlaps the other - unlike IoU,
+        correctly flags a small box nested inside a much larger one as "the same thing"."""
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        smaller = min(area_a, area_b)
+        return inter / smaller if smaller > 0 else 0.0
 
     def _fallback_detect(self, frame: np.ndarray) -> List[DetectionResult]:
         """

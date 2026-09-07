@@ -32,6 +32,13 @@ class TrackedObject:
         self.color_samples: List[Tuple[float, float, float]] = []  # accumulated mean BGR jersey samples
         self.appearance_hist: Optional[np.ndarray] = None  # EMA'd re-ID descriptor (see CentroidTracker._appearance_descriptor)
         self.lost_at_frame: Optional[int] = None  # frame_no this track was moved to the re-ID gallery, if any
+        # Ball-only (see CentroidTracker._update_ball / _ball_touches_a_player):
+        # consecutive processed frames this "ball" has sat inside/right at a
+        # player's own bounding box, whoever that happens to be. Tracks a
+        # single moving person's slow drift indefinitely otherwise - a real
+        # ball being dribbled still moves relative to a player's feet frame
+        # to frame, this doesn't.
+        self.ball_pinned_to_player_frames: int = 0
 
     def predicted_centroid(self) -> Tuple[float, float]:
         """
@@ -88,7 +95,174 @@ class TrackedObject:
         self.consecutive_lost += 1
 
 
-class CentroidTracker:
+class TeamAssignmentMixin:
+    """
+    HOME/AWAY jersey-color team assignment, shared by any tracker implementation
+    that maintains a `self.tracks: Dict[int, TrackedObject]` of player tracks plus
+    `self._team_reference_centroids` and `self._team_assign_counter` (a subclass's
+    __init__ must set both - see CentroidTracker for the canonical example). Pulled
+    out of CentroidTracker so a different tracking backend (e.g. BotSortPlayerTracker)
+    can reuse the exact same, already-tuned color logic instead of duplicating it.
+    """
+
+    # A torso crop this dark (mean HSV "value" out of 255) carries essentially no
+    # recoverable jersey color - just sensor noise - on real night-match footage
+    # where half the pitch sits outside the floodlight pools. Found by directly
+    # inspecting real torso crops from production footage: well-lit crops (clear,
+    # identifiable jersey color) measured V 80-135; crops in shadow (indistinguishable
+    # near-black torsos) measured V 43-80 with heavy overlap into the lit range, so a
+    # threshold has to sit low enough to keep it from starving tracks of samples
+    # entirely, but this one specific failure mode - averaging in near-black "colors"
+    # from unlit frames - was confirmed to be *the* root cause of team misassignment
+    # (both jersey colors and even the referee ending up in the same cluster).
+    MIN_COLOR_SAMPLE_VALUE = 55.0
+
+    def _sample_color(self, frame: Optional[np.ndarray], bbox: List[float]) -> Optional[Tuple[float, float, float]]:
+        """
+        Samples a player's torso region (avoids head/legs/background) and returns its
+        mean (hue, saturation, value) - hue+saturation is what actually identifies a
+        jersey *color*, independent of how brightly lit that patch of pitch happens to
+        be; a raw mean BGR triplet conflates color with brightness, which is exactly
+        what let two different jersey colors under different lighting collapse into
+        the same cluster (see _assign_teams). Returns None for a crop too dark to
+        carry reliable color information at all, rather than returning a near-black
+        "color" that would just be noise once averaged into a track's color history.
+        """
+        if frame is None:
+            return None
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        h = y2 - y1
+        torso_y1 = max(0, y1 + int(h * 0.15))
+        torso_y2 = min(frame.shape[0], y1 + int(h * 0.55))
+        x1c, x2c = max(0, x1), min(frame.shape[1], x2)
+        if torso_y2 <= torso_y1 or x2c <= x1c:
+            return None
+        crop = frame[torso_y1:torso_y2, x1c:x2c]
+        if crop.size == 0:
+            return None
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        mean_hsv = hsv.reshape(-1, 3).mean(axis=0)
+        if mean_hsv[2] < self.MIN_COLOR_SAMPLE_VALUE:
+            return None
+        return tuple(float(v) for v in mean_hsv)
+
+    # How far (in normalized hue+saturation space) a track's color can sit from
+    # its nearest team-cluster centroid before it's judged to not belong to
+    # either team at all - i.e. a referee, in a third kit color distinct from
+    # both teams. Calibrated directly from real footage: 11 confirmed real
+    # players measured a max of 0.072 (median 0.044) from their own team's
+    # centroid; a confirmed on-pitch referee (green kit, both teams white/navy)
+    # measured 0.211 from his *nearest* centroid - a clean ~3x gap. 0.15 sits
+    # in the middle of that gap with real margin on both sides.
+    REFEREE_OUTLIER_DIST = 0.15
+
+    def _assign_teams(self):
+        """
+        Assigns HOME / AWAY teams to player tracks by clustering jersey color (KMeans, k=2)
+        on hue+saturation - the actual color-identity signal, independent of how brightly
+        lit a given sample happened to be (see _sample_color; clustering on raw brightness-
+        entangled color was confirmed to collapse two different jersey colors into the same
+        cluster on real footage with uneven floodlighting). Position-based splitting breaks
+        the moment players cross the pitch, so color is the primary signal; tracks without
+        enough color samples yet fall back to a position split. A track's team is locked the
+        first time it's assigned - re-clustering only fills in still-unlocked tracks from
+        here on, it never revises an already-decided one (a real player doesn't switch sides
+        mid-match; see TrackedObject.team_locked).
+
+        A track whose color sits far from BOTH team clusters (see
+        REFEREE_OUTLIER_DIST) is labeled "REFEREE" instead of forced into
+        whichever team happens to be nominally closer - referees wear a kit
+        distinct from both teams by design, so this is a real, usable signal,
+        not a guess. Downstream event/stats code excludes REFEREE tracks from
+        the analysis entirely (see track.py).
+        """
+        players = [t for t in self.tracks.values() if t.class_name == "player"]
+        if len(players) < 2:
+            return
+
+        # Re-cluster periodically rather than every frame - jersey color is stable, so this
+        # is both cheaper and avoids jittering labels on single noisy samples.
+        self._team_assign_counter += 1
+        with_color = [p for p in players if len(p.color_samples) >= 3]
+
+        if len(with_color) >= 2 and self._team_assign_counter % 10 == 0:
+            from scipy.cluster.vq import kmeans2
+
+            # hue + saturation only (drop value/brightness) - two samples of the same
+            # jersey under different lighting should cluster together, which a
+            # brightness-sensitive feature (raw BGR, or HSV including V) won't do.
+            mean_hsv = np.array([np.mean(p.color_samples[-20:], axis=0) for p in with_color])
+            features = mean_hsv[:, :2]
+            norm = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-6)
+            try:
+                centroids, labels = kmeans2(norm, 2, seed=42, minit="++")
+
+                # A single non-team kit color (one referee) barely nudges the two
+                # team centroids - but real matches often have SEVERAL: both
+                # teams' goalkeepers (each in their own third color, distinct from
+                # their own outfield kit) plus a referee and assistant linesmen.
+                # Each of those still gets forced onto whichever of the two
+                # clusters its color happens to sit nominally closer to on this
+                # first pass, which drags that cluster's centroid away from the
+                # real jersey color by however much of the outlier leaked in -
+                # and a dragged centroid then makes REFEREE_OUTLIER_DIST (measured
+                # against a *clean* centroid) too lenient to catch the very
+                # outliers that caused the drag. Refitting once, using only the
+                # points that already look clean against the first-pass fit,
+                # removes that contamination before the real HOME/AWAY/REFEREE
+                # decision is made. Confirmed necessary on real professional-
+                # match footage (Barcelona vs Espanyol) where two pink/orange
+                # goalkeeper kits plus an orange-bibbed linesman were otherwise
+                # split across both team buckets instead of excluded.
+                dist_to_assigned = np.linalg.norm(norm - centroids[labels], axis=1)
+                inlier_mask = dist_to_assigned <= self.REFEREE_OUTLIER_DIST
+                if 2 <= int(inlier_mask.sum()) < len(norm):
+                    try:
+                        refit_centroids, _ = kmeans2(norm[inlier_mask], 2, seed=42, minit="++")
+                        d_same = np.linalg.norm(refit_centroids[0] - centroids[0])
+                        d_swap = np.linalg.norm(refit_centroids[0] - centroids[1])
+                        centroids = refit_centroids[::-1] if d_swap < d_same else refit_centroids
+                    except Exception:
+                        pass  # keep the original (unrefined) centroids
+
+                if self._team_reference_centroids is not None:
+                    # Keep HOME/AWAY consistent across re-clusters (kmeans label order is arbitrary)
+                    d_same = np.linalg.norm(centroids[0] - self._team_reference_centroids[0])
+                    d_swap = np.linalg.norm(centroids[0] - self._team_reference_centroids[1])
+                    if d_swap < d_same:
+                        centroids = centroids[::-1]
+                self._team_reference_centroids = centroids
+
+                # Re-measure every point against the final (possibly refit)
+                # centroids directly, rather than reusing the first-pass kmeans2
+                # `labels` - those were assigned before contamination was removed
+                # and can no longer be trusted for who's nearest to what.
+                for p, feat in zip(with_color, norm):
+                    if p.team_locked:
+                        continue
+                    dists = np.linalg.norm(centroids - feat, axis=1)
+                    nearest = int(np.argmin(dists))
+                    if dists[nearest] > self.REFEREE_OUTLIER_DIST:
+                        p.team = "REFEREE"
+                    else:
+                        p.team = "HOME" if nearest == 0 else "AWAY"
+                    p.team_locked = True
+            except Exception:
+                pass
+
+        # Players without a stable color signal yet (new tracks) fall back to spatial split
+        remaining = [p for p in players if not p.team_locked]
+        if remaining:
+            x_coords = [p.centroid[0] for p in players]
+            median_x = np.median(x_coords)
+            for p in remaining:
+                p.team = "HOME" if p.centroid[0] < median_x else "AWAY"
+                # Not locked yet - this is a low-confidence fallback (no color signal),
+                # so let it keep being revised until real color samples accumulate and
+                # the block above locks it in properly.
+
+
+class CentroidTracker(TeamAssignmentMixin):
     """
     Multi-object tracker for football players & ball.
     Matches detections to existing tracks via optimal (Hungarian) assignment against
@@ -121,6 +295,9 @@ class CentroidTracker:
         self.lost_gallery: Dict[int, TrackedObject] = {}
         self._team_reference_centroids: Optional[np.ndarray] = None
         self._team_assign_counter = 0
+        # Rolling log of every raw "ball"-class candidate position seen recently
+        # (frame_no, centroid), matched or not - see _is_static_ball_candidate.
+        self._ball_candidate_log: List[Tuple[int, Tuple[float, float]]] = []
 
     def _get_centroid(self, bbox: List[float], class_name: str) -> Tuple[float, float]:
         x1, y1, x2, y2 = bbox
@@ -130,23 +307,6 @@ class CentroidTracker:
         else:
             # For ball, geometric center
             return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-
-    def _sample_color(self, frame: Optional[np.ndarray], bbox: List[float]) -> Optional[Tuple[float, float, float]]:
-        """Samples the mean BGR color of a player's torso region (avoids head/legs/background)."""
-        if frame is None:
-            return None
-        x1, y1, x2, y2 = [int(v) for v in bbox]
-        h = y2 - y1
-        torso_y1 = max(0, y1 + int(h * 0.15))
-        torso_y2 = min(frame.shape[0], y1 + int(h * 0.55))
-        x1c, x2c = max(0, x1), min(frame.shape[1], x2)
-        if torso_y2 <= torso_y1 or x2c <= x1c:
-            return None
-        crop = frame[torso_y1:torso_y2, x1c:x2c]
-        if crop.size == 0:
-            return None
-        mean_color = crop.reshape(-1, 3).mean(axis=0)
-        return tuple(float(v) for v in mean_color)
 
     def _appearance_descriptor(self, frame: Optional[np.ndarray], bbox: List[float]) -> Optional[np.ndarray]:
         """
@@ -173,14 +333,31 @@ class CentroidTracker:
                 return np.zeros(64, dtype=np.float32)
             hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
             hist = cv2.calcHist([hsv], [0, 1], None, [8, 8], [0, 180, 0, 256])
-            cv2.normalize(hist, hist, norm_type=cv2.NORM_L2)
+            # L1 (sum-to-1), not L2 - _hist_distance's Bhattacharyya-coefficient
+            # formula (sum of sqrt(a_i*b_i)) is only guaranteed to land in
+            # [0, 1] when a and b are true probability distributions (L1-
+            # normalized). Under L2 normalization a histogram compared to
+            # ITSELF can score well above 1 (a busy real photo spreads mass
+            # across many bins, and L2 keeps each bin's share larger than an
+            # L1-normalized share would) - the formula then clips to a
+            # distance of 0 regardless of what's actually being compared, so
+            # every real (non-degenerate) crop silently reads as "identical"
+            # to every other. That's a real bug, not just an approximation:
+            # it means the re-ID gallery's appearance check was effectively a
+            # no-op on real footage, leaving only the position gate to
+            # disambiguate - exactly when two players cross paths or cluster
+            # near the ball, which is when appearance is needed most.
+            cv2.normalize(hist, hist, norm_type=cv2.NORM_L1)
             return hist.flatten()
 
         torso_hist = region_hist(y1 + int(h * 0.15), y1 + int(h * 0.55))
         legs_hist = region_hist(y1 + int(h * 0.55), y1 + int(h * 0.95))
         descriptor = np.concatenate([torso_hist, legs_hist]).astype(np.float32)
-        norm = np.linalg.norm(descriptor)
-        return descriptor / norm if norm > 0 else descriptor
+        # L1-normalize the combined vector too, so it's one valid probability
+        # distribution over both regions together (each region individually
+        # already sums to 1, so the raw concatenation sums to 2).
+        total = descriptor.sum()
+        return descriptor / total if total > 0 else descriptor
 
     def _hist_distance(self, a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
         """Hellinger distance between two normalized histograms: 0 = identical, 1 = disjoint."""
@@ -265,7 +442,7 @@ class CentroidTracker:
         active_tracks.extend(matched_tracks)
 
         # 2. Match or track the ball - no distance/identity gating (see _update_ball)
-        active_tracks.extend(self._update_ball(ball_dets, frame_no))
+        active_tracks.extend(self._update_ball(ball_dets, frame_no, player_dets=player_dets))
 
         # 3. Move stale player tracks into the re-ID gallery instead of deleting them outright,
         # so a player who reappears after a longer gap (occlusion, camera pan, brief exit) can
@@ -295,7 +472,67 @@ class CentroidTracker:
 
         return active_tracks
 
-    def _update_ball(self, ball_dets: List[DetectionResult], frame_no: int) -> List[TrackedObject]:
+    # How long a rolling window (in raw video frame_no units, not processed-frame
+    # calls - stays meaningful regardless of sampled_rate) to remember every raw
+    # "ball"-class candidate position, and how many separate sightings at
+    # essentially the same spot within that window mark it as a static false
+    # positive rather than the real ball. Calibrated from a real, confirmed case:
+    # a sponsor-board logo got matched as "the ball" for 2.5+ seconds spanning a
+    # free-kick strike, because it's a static, always-visible, confidently-
+    # detected shape - exactly what a real ball moving fast enough to blur or
+    # briefly leave frame cannot be. 90 frames is ~3.75s at a typical 24fps.
+    STATIC_BALL_CANDIDATE_WINDOW_FRAMES = 90
+    STATIC_BALL_CANDIDATE_MIN_SIGHTINGS = 3
+    STATIC_BALL_CANDIDATE_TOLERANCE_PX = 15.0
+
+    def _is_static_ball_candidate(self, pos: Tuple[float, float], frame_no: int) -> bool:
+        """True if `pos` has shown up as a "ball" candidate suspiciously often within
+        the recent window - a real ball in flight can't produce that; a fixed
+        background object confidently (mis)detected as a ball repeatedly can."""
+        sightings = sum(
+            1 for f, p in self._ball_candidate_log
+            if frame_no - f <= self.STATIC_BALL_CANDIDATE_WINDOW_FRAMES
+            and math.hypot(pos[0] - p[0], pos[1] - p[1]) <= self.STATIC_BALL_CANDIDATE_TOLERANCE_PX
+        )
+        return sightings >= self.STATIC_BALL_CANDIDATE_MIN_SIGHTINGS
+
+    # How many consecutive processed frames a "ball" can appear to sit inside
+    # (or right at the edge of) the same nearby player's own bounding box
+    # before we get suspicious it isn't really the ball at all - just a small
+    # mis-detected part of that one player (a shoe, sock, or reflective badge)
+    # that happens to satisfy ordinary trajectory continuity every frame,
+    # since it moves exactly however that person moves. _is_static_ball_
+    # candidate can't catch this: it only ever runs while *recovering* from a
+    # loss, but a false lock like this is never "lost" (it's continuously,
+    # confidently re-matched every frame), so it can persist indefinitely.
+    # Confirmed on real footage: a slow-walking match official kept a "ball"
+    # track pinned to himself for 10+ continuous seconds this way. A real
+    # ball at a player's feet (dribbling, shielding) still drifts relative to
+    # them frame to frame; this catches only the case where it doesn't.
+    # ~2s at a typical 25fps.
+    BALL_PINNED_TO_PLAYER_MAX_FRAMES = 50
+    # Padding (px) around a player's box that still counts as "at his feet" -
+    # a real ball there sits at/just past the box's bottom edge, not
+    # necessarily strictly inside it.
+    BALL_PINNED_TO_PLAYER_PAD_PX = 10.0
+
+    def _ball_touches_a_player(
+        self, centroid: Tuple[float, float], player_dets: List[DetectionResult]
+    ) -> bool:
+        cx, cy = centroid
+        pad = self.BALL_PINNED_TO_PLAYER_PAD_PX
+        for d in player_dets:
+            x1, y1, x2, y2 = d.bbox
+            if x1 - pad <= cx <= x2 + pad and y1 - pad <= cy <= y2 + pad:
+                return True
+        return False
+
+    def _update_ball(
+        self,
+        ball_dets: List[DetectionResult],
+        frame_no: int,
+        player_dets: Optional[List[DetectionResult]] = None,
+    ) -> List[TrackedObject]:
         """
         Unlike players, there's only ever one real ball in play - any new ball detection
         almost certainly IS the existing ball track, however far it's moved or however
@@ -303,7 +540,22 @@ class CentroidTracker:
         see YOLOv8Detector.detect_ball_tiled). So this skips distance-gated matching
         entirely rather than risk spawning a new ID every time the gap exceeds a fixed
         threshold - there's no second ball it could be confused with.
+
+        `player_dets` (this frame's player boxes), if given, guards against the
+        failure mode _is_static_ball_candidate can't: see
+        BALL_PINNED_TO_PLAYER_MAX_FRAMES.
         """
+        player_dets = player_dets or []
+        # Logged before anything else - even a candidate rejected below still
+        # counts as "this position keeps showing up", which is exactly the
+        # signal _is_static_ball_candidate needs.
+        for d in ball_dets:
+            self._ball_candidate_log.append((frame_no, self._get_centroid(d.bbox, "ball")))
+        self._ball_candidate_log = [
+            (f, p) for f, p in self._ball_candidate_log
+            if frame_no - f <= self.STATIC_BALL_CANDIDATE_WINDOW_FRAMES
+        ]
+
         ball_tracks = {t_id: t for t_id, t in self.tracks.items() if t.class_name == "ball"}
 
         if not ball_dets:
@@ -332,18 +584,63 @@ class CentroidTracker:
                 d for d in ball_dets
                 if math.hypot(*(np.subtract(self._get_centroid(d.bbox, "ball"), predicted))) <= max_jump
             ]
+            if t.consecutive_lost > 0:
+                # Only relevant while *recovering* from a loss - a ball that's
+                # been continuously, confidently tracked frame-to-frame is
+                # trusted even if genuinely stationary (a real dead-ball
+                # moment). The risk is specifically re-acquiring onto a static
+                # decoy after real detection dropped out.
+                candidates = [
+                    d for d in candidates
+                    if not self._is_static_ball_candidate(self._get_centroid(d.bbox, "ball"), frame_no)
+                ]
             if not candidates:
                 t.mark_lost()
                 return []
 
             best_det = max(candidates, key=lambda d: d.confidence)
             centroid = self._get_centroid(best_det.bbox, "ball")
+
+            if self._ball_touches_a_player(centroid, player_dets):
+                t.ball_pinned_to_player_frames += 1
+            else:
+                t.ball_pinned_to_player_frames = 0
+
+            if t.ball_pinned_to_player_frames > self.BALL_PINNED_TO_PLAYER_MAX_FRAMES:
+                # Likely locked onto a person, not the ball (see
+                # BALL_PINNED_TO_PLAYER_MAX_FRAMES) - drop this track outright
+                # rather than keep extending it, and try a fresh acquisition
+                # this same frame preferring a candidate that ISN'T pinned to
+                # a player, if one's available.
+                del self.tracks[t.track_id]
+                non_player_dets = [
+                    d for d in ball_dets
+                    if not self._ball_touches_a_player(self._get_centroid(d.bbox, "ball"), player_dets)
+                ]
+                return self._acquire_fresh_ball(non_player_dets or ball_dets, frame_no)
+
             t.update(best_det.bbox, centroid, frame_no)
             return [t]
 
         # First sighting (or the previous track already expired) - no trajectory to
-        # judge candidates against yet, so just trust the most confident detection.
-        best_det = max(ball_dets, key=lambda d: d.confidence)
+        # judge candidates against yet, so just trust the most confident detection,
+        # excluding known-static ones for the same reason as the recovery path above.
+        return self._acquire_fresh_ball(ball_dets, frame_no)
+
+    def _acquire_fresh_ball(
+        self, ball_dets: List[DetectionResult], frame_no: int
+    ) -> List[TrackedObject]:
+        """Starts a brand new ball track from whichever of `ball_dets` looks most
+        confident, excluding known-static decoys (see _is_static_ball_candidate).
+        Shared by the natural first-sighting path and by _update_ball's forced
+        re-acquisition after dropping a track pinned to a player."""
+        fresh_candidates = [
+            d for d in ball_dets
+            if not self._is_static_ball_candidate(self._get_centroid(d.bbox, "ball"), frame_no)
+        ]
+        if not fresh_candidates:
+            return []
+        best_det = max(fresh_candidates, key=lambda d: d.confidence)
         centroid = self._get_centroid(best_det.bbox, "ball")
 
         track = TrackedObject(
@@ -465,54 +762,3 @@ class CentroidTracker:
 
         return updated_tracks
 
-    def _assign_teams(self):
-        """
-        Assigns HOME / AWAY teams to player tracks by clustering jersey color (KMeans, k=2).
-        Position-based splitting breaks the moment players cross the pitch, so color is the
-        primary signal; tracks without enough color samples yet fall back to a position split.
-        A track's team is locked the first time it's assigned - re-clustering only fills in
-        still-unlocked tracks from here on, it never revises an already-decided one (a real
-        player doesn't change sides mid-match; see TrackedObject.team_locked).
-        """
-        players = [t for t in self.tracks.values() if t.class_name == "player"]
-        if len(players) < 2:
-            return
-
-        # Re-cluster periodically rather than every frame - jersey color is stable, so this
-        # is both cheaper and avoids jittering labels on single noisy samples.
-        self._team_assign_counter += 1
-        with_color = [p for p in players if len(p.color_samples) >= 3]
-
-        if len(with_color) >= 2 and self._team_assign_counter % 10 == 0:
-            from scipy.cluster.vq import kmeans2
-
-            features = np.array([np.mean(p.color_samples[-20:], axis=0) for p in with_color])
-            norm = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-6)
-            try:
-                centroids, labels = kmeans2(norm, 2, seed=42, minit="++")
-                if self._team_reference_centroids is not None:
-                    # Keep HOME/AWAY consistent across re-clusters (kmeans label order is arbitrary)
-                    d_same = np.linalg.norm(centroids[0] - self._team_reference_centroids[0])
-                    d_swap = np.linalg.norm(centroids[0] - self._team_reference_centroids[1])
-                    if d_swap < d_same:
-                        centroids = centroids[::-1]
-                        labels = 1 - labels
-                self._team_reference_centroids = centroids
-                for p, label in zip(with_color, labels):
-                    if p.team_locked:
-                        continue
-                    p.team = "HOME" if label == 0 else "AWAY"
-                    p.team_locked = True
-            except Exception:
-                pass
-
-        # Players without a stable color signal yet (new tracks) fall back to spatial split
-        remaining = [p for p in players if not p.team_locked]
-        if remaining:
-            x_coords = [p.centroid[0] for p in players]
-            median_x = np.median(x_coords)
-            for p in remaining:
-                p.team = "HOME" if p.centroid[0] < median_x else "AWAY"
-                # Not locked yet - this is a low-confidence fallback (no color signal),
-                # so let it keep being revised until real color samples accumulate and
-                # the block above locks it in properly.

@@ -52,12 +52,53 @@ class PitchCalibration:
         if homography is None:
             raise ValueError("Could not compute a homography from the given calibration points (are they collinear?).")
         self._homography = homography
+        try:
+            self._inverse_homography = np.linalg.inv(homography)
+        except np.linalg.LinAlgError:
+            raise ValueError("Could not invert the calibration homography (are the points collinear?).")
+        self._pitch_length_m = pitch_length_m
+        self._pitch_width_m = pitch_width_m
 
     def pixel_to_world_m(self, x: float, y: float) -> Tuple[float, float]:
         """Maps a single pixel coordinate to real-world pitch meters (x, y)."""
         pt = np.array([[[x, y]]], dtype=np.float32)
         world = cv2.perspectiveTransform(pt, self._homography)
         return float(world[0, 0, 0]), float(world[0, 0, 1])
+
+    def world_to_pixel(self, x_m: float, y_m: float) -> Tuple[float, float]:
+        """Inverse of pixel_to_world_m: maps a real-world pitch-meters coordinate
+        (x, y) to the pixel it projects to under this camera's calibration. Used
+        to place features whose real-world position is known by definition (e.g.
+        a goal sits at the real goal line) rather than derived from a detection,
+        so there's no pixel coordinate for it until it's projected forward."""
+        pt = np.array([[[x_m, y_m]]], dtype=np.float32)
+        px = cv2.perspectiveTransform(pt, self._inverse_homography)
+        return float(px[0, 0, 0]), float(px[0, 0, 1])
+
+    def contains_point_px(self, x_px: float, y_px: float, margin_m: float = 0.0) -> bool:
+        """
+        True if this pixel maps to a point within the real pitch rectangle
+        (0..pitch_length_m x 0..pitch_width_m), padded by `margin_m` in every
+        direction.
+
+        Used to reject "player" detections that a color-based grass mask alone
+        can't reliably exclude - confirmed on real footage (a professional
+        match's technical area/dugout strip) that bench/coaching staff
+        standing on grass-colored ground just past the touchline get through
+        app.cv.pitch_mask.PitchMask's color segmentation, since there's no
+        hard color break at the touchline itself for it to key off. This is a
+        precise geometric check instead - independent of lighting, turf color,
+        or how close the technical area's ground color is to the pitch's -
+        but only available once a camera has been calibrated (see
+        PitchCalibration.from_points_json); an uncalibrated camera has no
+        pitch rectangle to test against, so callers should fall back to the
+        color-based mask alone in that case.
+        """
+        x_m, y_m = self.pixel_to_world_m(x_px, y_px)
+        return (
+            -margin_m <= x_m <= self._pitch_length_m + margin_m
+            and -margin_m <= y_m <= self._pitch_width_m + margin_m
+        )
 
     def distance_m(self, p1_px: Tuple[float, float], p2_px: Tuple[float, float]) -> float:
         """Real-world straight-line distance in meters between two pixel points."""
