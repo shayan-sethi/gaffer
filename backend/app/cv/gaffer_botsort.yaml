@@ -21,5 +21,16 @@ gmc_method: sparseOptFlow
 
 proximity_thresh: 0.5
 appearance_thresh: 0.8
+# Tried enabling re-ID with model: yolov8n-cls.pt (a generic ImageNet
+# classifier) expecting it to catch the same ID-switches our own tracker
+# makes. Confirmed on real footage that this made things dramatically
+# WORSE (255 "players" in a 3-minute window that should have ~22, vs ~36-41
+# without it) - an ImageNet classifier has no notion of "this specific
+# person", so its embeddings are closer to noise for this task, and since
+# BoT-SORT uses the appearance score as a hard veto on an otherwise-good
+# motion match, noisy embeddings kept rejecting real continuations and
+# spawning new IDs instead. A real fix needs an actual person-re-id-trained
+# model (e.g. OSNet via a dedicated re-id library), not any classifier that
+# happens to expose a feature layer - left off until that's in place.
 with_reid: False
 model: auto

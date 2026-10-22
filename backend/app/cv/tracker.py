@@ -28,6 +28,10 @@ class TrackedObject:
         # changes) and silently misattribute goals/shots/possession to the
         # wrong team mid-match.
         self.team_locked: bool = False
+        # The team _assign_teams computed for this track the PREVIOUS time it
+        # classified it, while still unlocked - see _assign_teams for why a
+        # track now needs to agree with itself twice in a row before locking.
+        self._pending_team: Optional[str] = None
         self.total_distance_px: float = 0.0
         self.color_samples: List[Tuple[float, float, float]] = []  # accumulated mean BGR jersey samples
         self.appearance_hist: Optional[np.ndarray] = None  # EMA'd re-ID descriptor (see CentroidTracker._appearance_descriptor)
@@ -156,6 +160,19 @@ class TeamAssignmentMixin:
     # in the middle of that gap with real margin on both sides.
     REFEREE_OUTLIER_DIST = 0.15
 
+    # A track can't lock its team (even with two agreeing reads - see
+    # _pending_team) until it has accumulated at least this many raw color
+    # samples. Two consecutive agreeing reads guards against a track ID
+    # briefly representing the wrong physical person early on, but that
+    # alone isn't enough if the wrong identity happens to persist for those
+    # first couple of reads - confirmed on real footage where a track locked
+    # as "REFEREE" from its very first ~1.6s despite spending 95%+ of a full
+    # 2-minute clip as an obviously real, correctly-colored player. Requiring
+    # a real chunk of accumulated history (several seconds' worth of samples)
+    # before a lock is allowed at all makes that kind of early, brief mixup
+    # far less likely to be the only evidence a lock is based on.
+    MIN_COLOR_SAMPLES_TO_LOCK = 150
+
     def _assign_teams(self):
         """
         Assigns HOME / AWAY teams to player tracks by clustering jersey color (KMeans, k=2)
@@ -164,10 +181,31 @@ class TeamAssignmentMixin:
         entangled color was confirmed to collapse two different jersey colors into the same
         cluster on real footage with uneven floodlighting). Position-based splitting breaks
         the moment players cross the pitch, so color is the primary signal; tracks without
-        enough color samples yet fall back to a position split. A track's team is locked the
-        first time it's assigned - re-clustering only fills in still-unlocked tracks from
-        here on, it never revises an already-decided one (a real player doesn't switch sides
+        enough color samples yet fall back to a position split. A track's team locks once
+        two consecutive re-clusters agree on it AND it has at least MIN_COLOR_SAMPLES_TO_LOCK
+        accumulated color samples (not the first classification alone - see
+        TrackedObject._pending_team) - after that, re-clustering only fills in still-unlocked
+        tracks, it never revises an already-locked one (a real player doesn't switch sides
         mid-match; see TrackedObject.team_locked).
+
+        Two safeguards against locking too early, both confirmed necessary on real production
+        footage (Barcelona vs Espanyol):
+        - Requiring agreement twice, not locking on the very first classification, guards
+          against a track ID briefly representing the WRONG physical person early in its life
+          (e.g. a Hungarian-assignment mismatch or a re-ID mix-up hands it a keeper's or
+          linesman's identity for a few seconds before settling onto the real player it
+          tracks for the rest of the match).
+        - Requiring a minimum accumulated sample count guards against a DIFFERENT failure mode
+          agreement-twice alone doesn't catch: a track that's the same real, correctly-kitted
+          player its entire life, but whose first couple of color reads happen to land as an
+          outlier anyway (a torso crop occasionally catches enough grass-bleed at its edges to
+          drag the reading off, even though every sample still visually shows the same kit -
+          see the median vs mean comment below). If that noisy pair of reads shows up early
+          and agrees with itself, two-consecutive-agreement alone would still lock it wrong;
+          waiting for a real chunk of history first means that pair is a small fraction of
+          what the lock is ultimately based on, not the whole basis for it.
+        Neither safeguard costs anything for a track that was right from the start - it just
+        takes a little longer to lock in.
 
         A track whose color sits far from BOTH team clusters (see
         REFEREE_OUTLIER_DIST) is labeled "REFEREE" instead of forced into
@@ -191,8 +229,17 @@ class TeamAssignmentMixin:
             # hue + saturation only (drop value/brightness) - two samples of the same
             # jersey under different lighting should cluster together, which a
             # brightness-sensitive feature (raw BGR, or HSV including V) won't do.
-            mean_hsv = np.array([np.mean(p.color_samples[-20:], axis=0) for p in with_color])
-            features = mean_hsv[:, :2]
+            #
+            # MEDIAN across the recent samples, not mean - confirmed on real footage
+            # that a genuinely correctly-tracked player can still read as a color
+            # outlier under a plain mean: a torso crop occasionally picks up enough
+            # grass-bleed at its edges that a MINORITY of noisy/off-color samples
+            # drags the arithmetic average toward a hue that matches neither team,
+            # even though every single sample still visually shows the same real
+            # kit. The median is far more resistant to that kind of minority
+            # contamination than a mean is.
+            median_hsv = np.array([np.median(p.color_samples[-20:], axis=0) for p in with_color])
+            features = median_hsv[:, :2]
             norm = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-6)
             try:
                 centroids, labels = kmeans2(norm, 2, seed=42, minit="++")
@@ -242,16 +289,25 @@ class TeamAssignmentMixin:
                         continue
                     dists = np.linalg.norm(centroids - feat, axis=1)
                     nearest = int(np.argmin(dists))
-                    if dists[nearest] > self.REFEREE_OUTLIER_DIST:
-                        p.team = "REFEREE"
-                    else:
-                        p.team = "HOME" if nearest == 0 else "AWAY"
-                    p.team_locked = True
+                    candidate = "REFEREE" if dists[nearest] > self.REFEREE_OUTLIER_DIST else ("HOME" if nearest == 0 else "AWAY")
+                    p.team = candidate
+                    if p._pending_team != candidate:
+                        p._pending_team = candidate
+                    elif len(p.color_samples) >= self.MIN_COLOR_SAMPLES_TO_LOCK:
+                        p.team_locked = True
+                    # else: agrees with the pending read, but still hasn't accumulated
+                    # enough history to lock yet - stays pending, re-checked next time.
             except Exception:
                 pass
 
-        # Players without a stable color signal yet (new tracks) fall back to spatial split
-        remaining = [p for p in players if not p.team_locked]
+        # Players without a stable color signal yet (new tracks) fall back to spatial split.
+        # A track that already got a color-based candidate this round (_pending_team set)
+        # is deliberately excluded here even though it isn't locked yet - it HAS a real
+        # classification, just awaiting a second agreeing read (see _assign_teams' docstring);
+        # letting the position fallback overwrite it would throw away a real color-based
+        # REFEREE/HOME/AWAY read (including a confirmed non-team-color outlier) in favor of
+        # a much cruder left/right guess, on every single call until it happens to lock.
+        remaining = [p for p in players if not p.team_locked and p._pending_team is None]
         if remaining:
             x_coords = [p.centroid[0] for p in players]
             median_x = np.median(x_coords)
@@ -654,6 +710,37 @@ class CentroidTracker(TeamAssignmentMixin):
         self.next_track_id += 1
         return [track]
 
+    # How far (in the same normalized hue+saturation space _assign_teams clusters
+    # on) a single new detection's color can sit from a track's own established
+    # color before a live frame-to-frame match is rejected outright, even if
+    # position alone made it look like the best available match that frame.
+    # Established color is a MEDIAN over many samples (stable); a candidate
+    # detection is a single frame's reading (noisier), so this needs more slack
+    # than REFEREE_OUTLIER_DIST (which compares two already-aggregated values).
+    # Confirmed necessary on real footage: with matching gated on position alone,
+    # several tracks silently absorbed a completely different person's identity
+    # mid-match - a real player running near a camera operator/linesman/bench
+    # staff member for even one frame was enough, since nothing but position
+    # ever discriminated between them.
+    COLOR_MISMATCH_GATE_DIST = 0.3
+    # A track needs at least this many established color samples before its own
+    # color is trusted enough to reject an otherwise position-plausible match -
+    # a brand new track's first couple of readings can themselves be noisy (see
+    # MIN_COLOR_SAMPLES_TO_LOCK's docstring), so gating this early would risk
+    # rejecting a genuinely correct match based on bad reference data.
+    MIN_TRACK_COLOR_SAMPLES_FOR_GATE = 10
+
+    def _hue_sat_distance(self, hsv_a: Tuple[float, float, float], hsv_b: Tuple[float, float, float]) -> float:
+        """Normalized hue+saturation Euclidean distance between two raw (h, s, v)
+        readings - the exact feature space _assign_teams clusters team color on,
+        reused here to judge whether a candidate detection's color plausibly
+        belongs to a given track at all."""
+        a = np.array(hsv_a[:2], dtype=float)
+        b = np.array(hsv_b[:2], dtype=float)
+        a_norm = a / (np.linalg.norm(a) + 1e-6)
+        b_norm = b / (np.linalg.norm(b) + 1e-6)
+        return float(np.linalg.norm(a_norm - b_norm))
+
     def _match_detections(
         self,
         existing_tracks: Dict[int, TrackedObject],
@@ -727,20 +814,46 @@ class CentroidTracker(TeamAssignmentMixin):
         # distances) can never be worth "trading into" a nearby track's good
         # match, so it can't contaminate assignments outside its own row/column.
         gated_cost_matrix = np.where(cost_matrix > max_distance, 1e6, cost_matrix)
+
+        # Same gate-to-sentinel treatment for a color mismatch - see
+        # COLOR_MISMATCH_GATE_DIST's docstring for why position distance alone
+        # isn't enough to keep a live match from silently latching onto a
+        # completely different (but position-plausible) person. Only applied
+        # to player tracks with enough established color history to trust as a
+        # reference (see MIN_TRACK_COLOR_SAMPLES_FOR_GATE); a candidate whose
+        # own color can't be read (too dark - see _sample_color) isn't gated
+        # either way, since there's nothing to compare.
+        color_mismatch = np.zeros_like(gated_cost_matrix, dtype=bool)
+        det_colors = [
+            self._sample_color(frame, d.bbox) if d.class_name == "player" else None
+            for d in detections
+        ]
+        for i, t_id in enumerate(track_ids):
+            track = existing_tracks[t_id]
+            if track.class_name != "player" or len(track.color_samples) < self.MIN_TRACK_COLOR_SAMPLES_FOR_GATE:
+                continue
+            track_color = np.median(track.color_samples[-20:], axis=0)
+            for j, det_color in enumerate(det_colors):
+                if det_color is None:
+                    continue
+                if self._hue_sat_distance(track_color, det_color) > self.COLOR_MISMATCH_GATE_DIST:
+                    color_mismatch[i, j] = True
+                    gated_cost_matrix[i, j] = 1e6
+
         row_ind, col_ind = linear_sum_assignment(gated_cost_matrix)
 
         assigned_rows = set()
         assigned_cols = set()
 
         for r, c in zip(row_ind, col_ind):
-            if cost_matrix[r, c] > max_distance:
+            if cost_matrix[r, c] > max_distance or color_mismatch[r, c]:
                 continue
 
             t_id = track_ids[r]
             det = detections[c]
             centroid = det_centroids[c]
 
-            color = self._sample_color(frame, det.bbox) if det.class_name == "player" else None
+            color = det_colors[c]  # already sampled above, for the color-mismatch gate
             descriptor = self._appearance_descriptor(frame, det.bbox) if try_reid else None
             existing_tracks[t_id].update(det.bbox, centroid, frame_no, color_sample=color, appearance_descriptor=descriptor)
             updated_tracks.append(existing_tracks[t_id])

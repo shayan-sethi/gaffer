@@ -375,6 +375,72 @@ def test_centroid_tracker_isolated_track_does_not_poison_nearby_matches():
     assert len(tracker.tracks) == 4
 
 
+def test_centroid_tracker_rejects_a_closer_but_wrong_colored_match():
+    # Regression test for a real bug found on production footage: live frame-
+    # to-frame matching (_match_detections) gated purely on position distance,
+    # with no color/appearance check at all - only a track that had been LOST
+    # for a while got its color checked, via the separate re-ID path. That
+    # meant a real player's track could silently latch onto a completely
+    # different, merely position-adjacent person (a linesman, a camera
+    # operator, bench staff) any time that person's detection happened to be
+    # closer to the track's predicted position than the real player's own
+    # detection was that frame - several tracks on real footage flip-flopped
+    # between different real identities this way. A color-consistency gate on
+    # the match itself (not just re-ID) should reject the closer-but-wrong-
+    # colored detection and keep the track on its real, correctly-colored one.
+    frame = np.full((400, 400, 3), (0, 100, 0), dtype=np.uint8)  # grass-green background
+
+    def paint_torso(img, bbox, bgr_color):
+        x1, y1, x2, y2 = bbox
+        h = y2 - y1
+        ty1, ty2 = y1 + int(h * 0.15), y1 + int(h * 0.55)
+        img[ty1:ty2, x1:x2] = bgr_color
+
+    tracker = CentroidTracker(max_lost_frames=10, max_distance_px=100.0)
+    navy_bgr = (128, 0, 0)
+    orange_bgr = (0, 140, 255)
+
+    bbox = [100, 100, 140, 200]
+    f = frame.copy()
+    paint_torso(f, bbox, navy_bgr)
+
+    # Establish enough real color history on this track for the gate to trust
+    # it as a reference (see MIN_TRACK_COLOR_SAMPLES_FOR_GATE).
+    track_id = None
+    for i in range(12):
+        active = tracker.update([DetectionResult("player", bbox, 0.9, 1)], frame_no=i + 1, frame=f)
+        track_id = active[0].track_id
+    assert len(tracker.tracks[track_id].color_samples) >= tracker.MIN_TRACK_COLOR_SAMPLES_FOR_GATE
+
+    # Next frame: the real player moved a small, plausible amount (still navy).
+    # A DIFFERENT, orange-kitted person is standing even closer to the track's
+    # predicted position - purely on distance, Hungarian assignment would
+    # prefer the orange detection.
+    real_bbox = [108, 108, 148, 208]
+    wrong_bbox = [104, 104, 144, 204]  # closer to the predicted position
+    f2 = frame.copy()
+    paint_torso(f2, real_bbox, navy_bgr)
+    paint_torso(f2, wrong_bbox, orange_bgr)
+
+    active = tracker.update(
+        [DetectionResult("player", wrong_bbox, 0.9, 1), DetectionResult("player", real_bbox, 0.9, 1)],
+        frame_no=13,
+        frame=f2,
+    )
+
+    updated_track = tracker.tracks[track_id]
+    # The track must have followed its real, navy-colored continuation - not
+    # been hijacked by the closer, wrong-colored detection.
+    assert updated_track.bbox == real_bbox
+    assert updated_track.consecutive_lost == 0
+    # The orange detection must NOT have been folded into this track - it
+    # should show up as a distinct, separate track instead.
+    other_track_ids = {t.track_id for t in active} - {track_id}
+    assert len(other_track_ids) == 1
+    other_track = tracker.tracks[next(iter(other_track_ids))]
+    assert other_track.bbox == wrong_bbox
+
+
 def test_centroid_tracker_unconfirmed_track_is_not_kept_as_reid_bait():
     # Regression test for a real bug found on production footage: a single-
     # frame detector false positive (a bright line/reflection misread as a
@@ -555,6 +621,78 @@ def test_assign_teams_survives_multiple_non_team_kit_colors():
     assert keeper_home_side.team == "REFEREE"
     assert keeper_away_side.team == "REFEREE"
     assert linesman.team == "REFEREE"
+
+
+def test_assign_teams_recovers_from_an_early_misclassification():
+    # Regression test for a real failure mode confirmed on production footage
+    # (Barcelona vs Espanyol): a track ID can briefly represent the WRONG
+    # physical person right after it's created (e.g. a Hungarian-assignment
+    # mismatch hands it a goalkeeper's identity for its first few real
+    # detections) before settling onto the real outfield player it tracks for
+    # the rest of the match. Locking on that first, unrepresentative
+    # classification permanently mislabeled the track as "REFEREE" even
+    # though 95%+ of its life was a normal, correctly-colored player - three
+    # real tracks on one clip were lost to exactly this. Requiring two
+    # consecutive agreeing classifications before locking (see
+    # TrackedObject._pending_team) should let this one recover instead.
+    tracker = CentroidTracker(max_lost_frames=10, max_distance_px=100.0)
+
+    def make_player(track_id: int, hue: float, sat: float) -> TrackedObject:
+        p = TrackedObject(track_id, "player", [0, 0, 40, 100], (float(track_id) * 100, 100.0), 1)
+        p.color_samples = [(hue, sat, 100.0)] * 5
+        return p
+
+    home_hue_sat = [(113, 79), (115, 67), (124, 91), (112, 87), (114, 57), (118, 71)]
+    away_hue_sat = [(28, 70), (32, 66), (25, 74), (35, 62), (30, 69), (27, 73)]
+    home_players = [make_player(i + 1, h, s) for i, (h, s) in enumerate(home_hue_sat)]
+    away_players = [make_player(i + 7, h, s) for i, (h, s) in enumerate(away_hue_sat)]
+
+    # This track starts out looking like the pink-kit goalkeeper (a real
+    # outlier, same as the keeper in the test above)...
+    switcher = make_player(50, 160, 45)
+
+    tracker.tracks = {p.track_id: p for p in home_players + away_players + [switcher]}
+    tracker._team_assign_counter = 9
+    tracker._assign_teams()
+    assert switcher.team == "REFEREE"
+    assert switcher.team_locked is False  # only one agreeing read so far - not locked yet
+    # Which literal label ("HOME" vs "AWAY") lands on the navy/blue cluster is
+    # arbitrary (kmeans2 label order isn't meaningful) - what matters is that
+    # the switcher later agrees with THIS cluster's real players, whichever
+    # string that turned out to be.
+    home_label = home_players[0].team
+    assert home_label in {"HOME", "AWAY"}
+
+    # ...then, a few seconds later, the SAME track ID has settled onto a real
+    # player from the navy/blue side instead (its rolling color_samples window
+    # now reflects a completely different physical person - see
+    # CentroidTracker._appearance_descriptor for the live re-ID gallery this
+    # same kind of hand-off can come from). Still only a handful of samples
+    # accumulated so far, same as real life right after the hand-off.
+    switcher.color_samples = [(114.0, 70.0, 100.0)] * 5
+    tracker._team_assign_counter = 9
+    tracker._assign_teams()
+    assert switcher.team == home_label
+    assert switcher.team_locked is False  # disagreed with the pending REFEREE read - still not locked
+
+    # A third, later read agrees with the second - but still shouldn't lock
+    # yet, since only a handful of color samples have accumulated so far (see
+    # MIN_COLOR_SAMPLES_TO_LOCK's docstring for the separate failure mode this
+    # guards against: a correctly-tracked player's first couple of reads can
+    # themselves be a noisy outlier, so two agreeing reads alone isn't enough
+    # unless there's also a real chunk of accumulated history behind them).
+    tracker._team_assign_counter = 9
+    tracker._assign_teams()
+    assert switcher.team == home_label
+    assert switcher.team_locked is False
+
+    # Once enough real history has accumulated (still the same, consistent
+    # navy/blue reading), the next agreeing re-cluster finally locks it in.
+    switcher.color_samples = [(114.0, 70.0, 100.0)] * tracker.MIN_COLOR_SAMPLES_TO_LOCK
+    tracker._team_assign_counter = 9
+    tracker._assign_teams()
+    assert switcher.team == home_label
+    assert switcher.team_locked is True
 
 
 def test_event_detector_and_goals():
