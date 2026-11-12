@@ -9,8 +9,9 @@ import clip_ids as C
 meta = json.load(open(out + "/meta.json"))
 rows = sorted((json.loads(l) for l in open(out + "/dets.jsonl")), key=lambda r: r["frame"])
 sfps = meta["fps"] / meta["stride"]
-pf, _ = C.track(rows, np.ones((meta["height"], meta["width"]), np.uint8), [], sfps)
-ident, un, nraw, nlong, _ = (C.lock_identities_greedy if greedy else C.lock_identities)(pf, sfps)
+pf, _ = C.track(rows, C.load_mask(meta), [], sfps)
+import os
+ident, un, nraw, nlong, _ = (C.lock_identities_greedy(pf, sfps) if greedy else C.lock_identities(pf, sfps, colourer=C.TrackletColour() if os.environ.get("COLOUR_LOCK") else None))
 print(f"raw ids {nraw}, tracklets {nlong}, identities {len(ident)}")
 tot = 0
 H = None

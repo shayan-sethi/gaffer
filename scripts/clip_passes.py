@@ -25,8 +25,10 @@ import clip_ids as C                                   # noqa: E402
 
 BALL_CONF = 0.08
 JUMP_PX_PER_ROW = 50      # max ball movement between candidates, per sampled frame of gap
-POSSESS_RATIO, MIN_HOLD, MAX_GAP_S, MIN_TRAVEL = 0.8, 2, 2.0, 0.6
+POSSESS_RATIO, MIN_HOLD, MAX_GAP_S, MIN_TRAVEL = 0.8, 2, float(os.environ.get("MAX_GAP_S", 2.0)), 0.6      # MAX_GAP_S: longest unseen stretch a CONFIRMED pass may span
 SUPPORT_ROWS = 3
+LBL = dict(kv.split(":") for kv in os.environ.get("TEAM_LABELS", "").split(",") if ":" in kv)      # e.g. W:P,B:B
+MIN_CHAIN = int(os.environ.get("MIN_CHAIN", 6))      # shortest stretch of ball positions that counts as a real ball track
 SCALE = 1.0               # frame width / 1280; pixel thresholds below are tuned at 720p
 
 
@@ -43,37 +45,95 @@ def ball_path(rows, ballrows, nrows):
     cands = sorted([c for c in cands if (int(c[1] // (14 * SCALE)), int(c[2] // (14 * SCALE))) not in static])
     det_rows = sorted(ballrows)
     STEP = max(1, int(np.median(np.diff(det_rows)))) if len(det_rows) > 1 else 1      # rows between ball detections
-    m = len(cands)
-    best, back = [0.0] * m, [-1] * m
-    for j in range(m):
-        best[j] = cands[j][3] + 0.5
-        for i in range(j - 1, -1, -1):
-            gap = cands[j][0] - cands[i][0]
-            if gap < 1:
-                continue
-            if gap > 8 * STEP:
-                break
-            dist = float(np.hypot(cands[j][1] - cands[i][1], cands[j][2] - cands[i][2]))
-            if dist > JUMP_PX_PER_ROW * SCALE * gap:
-                continue
-            s = best[i] + cands[j][3] + 0.5 - dist / (40 * SCALE) - 0.4 * max(0.0, gap / STEP - 1)
-            if s > best[j]:
-                best[j], back[j] = s, i
-    path = []
-    if m:
-        j = int(np.argmax(best))
-        while j != -1:
-            path.append(cands[j])
-            j = back[j]
-        path.reverse()
-    ball, real = {}, [p[0] for p in path]
-    for (f0, x0, y0, _), (f1, x1, y1, _) in zip(path, path[1:]):
-        for f in range(f0, f1 + 1):
-            t = (f - f0) / (f1 - f0)
-            ball[f] = (x0 + t * (x1 - x0), y0 + t * (y1 - y0))
-    if path:
+    def best_chain(cs):
+        m = len(cs)
+        best, back = [0.0] * m, [-1] * m
+        for j in range(m):
+            best[j] = cs[j][3] + 0.5
+            for i in range(j - 1, -1, -1):
+                gap = cs[j][0] - cs[i][0]
+                if gap < 1:
+                    continue
+                if gap > 8 * STEP:
+                    break
+                dist = float(np.hypot(cs[j][1] - cs[i][1], cs[j][2] - cs[i][2]))
+                if dist > JUMP_PX_PER_ROW * SCALE * gap:
+                    continue
+                sc = best[i] + cs[j][3] + 0.5 - dist / (40 * SCALE) - 0.4 * max(0.0, gap / STEP - 1)
+                if sc > best[j]:
+                    best[j], back[j] = sc, i
+        chain = []
+        if m:
+            j = int(np.argmax(best))
+            while j != -1:
+                chain.append(cs[j])
+                j = back[j]
+            chain.reverse()
+        return chain
+
+    # the ball is often hidden for seconds (a scrum, a long clearance): take the best chain, then look again in the time it does not cover
+    chains, remaining = [], list(cands)
+    for _ in range(6):
+        ch = best_chain(remaining)
+        if len(ch) < MIN_CHAIN:
+            break
+        chains.append(ch)
+        f0, f1 = ch[0][0], ch[-1][0]
+        remaining = [c for c in remaining if not (f0 - 2 * STEP <= c[0] <= f1 + 2 * STEP)]
+    ball, real = {}, []
+    for path in chains:
+        real += [p[0] for p in path]
+        for (f0, x0, y0, _), (f1, x1, y1, _) in zip(path, path[1:]):
+            for f in range(f0, f1 + 1):
+                t = (f - f0) / (f1 - f0)
+                ball[f] = (x0 + t * (x1 - x0), y0 + t * (y1 - y0))
         ball[path[-1][0]] = (path[-1][1], path[-1][2])
+    path = [p for ch in chains for p in ch]
     return ball, np.array(real), len(cands), len(path), len(static)
+
+
+def bridge_ball(ball, real, rows_n, ident, sfps, max_coast_s=3.0, STEP_ROWS=2):
+    """The ball is hidden for stretches (scrum, a player's legs). For each hidden stretch between two SEEN stretches:
+      - estimate where the ball is by constant-velocity coasting from the last seen point and, backwards, from the next seen point,
+        blended (a Kalman-style predict step with no measurement); and
+      - name the group of players within ~1.2 body-heights of that estimate ('ball is in this group').
+    Returns (est, hidden): est[row] = (x, y) estimated; hidden = list of (row0, row1, group_of_player_indices_at_start, group_at_end).
+    The estimate is NEVER used to award possession - only the groups before/after are used, to mark a possible pass as 'uncertain'."""
+    seen = sorted(set(int(r) for r in real))
+    est, hidden = {}, []
+    if len(seen) < 2:
+        return est, hidden
+    def vel(r_end, back):
+        pts = [(r, ball[r]) for r in (range(r_end, r_end - 8, -1) if back else range(r_end, r_end + 8)) if r in ball and r in set(seen)]
+        if len(pts) < 2:
+            return np.zeros(2)
+        (r0, p0), (r1, p1) = pts[0], pts[-1]
+        v = (np.array(p1) - np.array(p0)) / (r1 - r0)       # px per row, in the direction pts were listed
+        return v
+    def near(r, p):
+        out = []
+        for k, I in enumerate(ident):
+            o = I["frames"].get(r)
+            if o:
+                h = o["box"][3] - o["box"][1]
+                if np.hypot(p[0] - (o["box"][0] + o["box"][2]) / 2, p[1] - (o["box"][3] - 0.1 * h)) / h < 1.2:
+                    out.append(k)
+        return out
+    for a, b in zip(seen, seen[1:]):
+        if b - a <= 2 * STEP_ROWS:                  # ordinary gaps between detections made every other row: not hidden
+            continue
+        gap_s = (b - a) / sfps
+        pa, pb = np.array(ball[a]), np.array(ball[b])
+        va, vb = -vel(a, True), vel(b, False)          # 'back' list runs backwards in time: flip so va points forward
+        coast = gap_s <= max_coast_s
+        long_gap = gap_s > max_coast_s
+        for r in range(a + 1, b):
+            t = (r - a) / (b - a)
+            fwd = pa + va * (r - a) * (0.97 ** (r - a))          # keeps going, slowing a little (friction)
+            bwd = pb - vb * (b - r) * (0.97 ** (b - r))
+            est[r] = tuple((1 - t) * fwd + t * bwd) if coast else tuple((1 - t) * pa + t * pb)
+        hidden.append((a, b, near(a, pa), near(b, pb), round(gap_s, 1)))
+    return est, hidden
 
 
 def main():
@@ -91,14 +151,17 @@ def main():
     ballrows = {k: v for k, v in ballrows.items()}
     nrows_for_static = len(rows)
     sfps = meta["fps"] / meta["stride"]
-    per_frame, _ = C.track(rows, np.ones((meta["height"], meta["width"]), np.uint8), [], sfps)
+    per_frame, _ = C.track(rows, C.load_mask(meta), [], sfps)
     colourer = C.TrackletColour(video, rows) if os.environ.get("COLOUR_LOCK") else None
     ident, unassigned, *_ = C.lock_identities(per_frame, sfps, colourer=colourer)
     cols = {}
     if os.environ.get("RETEAM"):                    # teams from grass-free shirt colour (3 groups: two teams + odd colours)
         cols = C.reteam(meta["video"], rows, ident)
+        C.enforce_team_size(ident, int(os.environ.get("TEAM_SIZE", 0)))
     officials = set()
-    for tm in ("W", "B"):                           # a shirt colour far from the rest of its team (e.g. a referee in black among blue shirts)
+    for tm in (("W", "B") if os.environ.get("OFFICIALS_BY_COLOUR") else ()):   # opt-in: colour alone wrongly removed a bib player
+        pass
+    for tm in ():                                   # a shirt colour far from the rest of its team (e.g. a referee in black among blue shirts)
         mem = [k for k, I in enumerate(ident) if I.get("team") == tm and k in cols]
         if len(mem) >= 5:
             med = np.median([cols[k] for k in mem], axis=0)
@@ -121,27 +184,51 @@ def main():
     gk_side = {}
     for k, I in enumerate(ident):
         team[k] = "O" if k in officials else I.get("team", "?") if I.get("team") in ("W", "B") else "?"
-    if os.environ.get("HFILE"):                     # odd-colour people: near a goal = keeper, elsewhere = referee
+    if os.environ.get("HFILE"):
+        stat = {}
         for k, I in enumerate(ident):
-            if team[k] != "?":
+            if team[k] == "O":
                 continue
-            xs_ = [(lambda p_: p_[0] / p_[2])(Hinv @ np.array([(o["box"][0] + o["box"][2]) / 2, o["box"][3], 1.0])) for o in I["frames"].values()]
-            mx = float(np.mean(xs_))
-            if mx < 22 or mx > PL - 22:
-                gk_side[k] = "L" if mx < PL / 2 else "R"
-                forced = os.environ.get("GK_LEFT_TEAM" if gk_side[k] == "L" else "GK_RIGHT_TEAM")   # e.g. GK_LEFT_TEAM=W
+            xs_ = np.array([(lambda p_: p_[0] / p_[2])(Hinv @ np.array([(o["box"][0] + o["box"][2]) / 2, o["box"][3], 1.0])) for o in I["frames"].values()])
+            stat[k] = (float(xs_.mean()), float(np.ptp(xs_)))
+        # keepers by POSITION (colour can't tell: a red or yellow top may or may not look 'odd' next to the teams):
+        # the identity that stays near a goal line and barely moves along the pitch is that side's keeper
+        for side, cond in (("L", lambda m: m < 28), ("R", lambda m: m > PL - 28)):
+            cand = [k for k, (m, r) in stat.items() if cond(m) and r < 18]
+            if cand:
+                k = min(cand, key=lambda q: stat[q][1])
+                gk_side[k] = side
+                forced = os.environ.get("GK_LEFT_TEAM" if side == "L" else "GK_RIGHT_TEAM")
                 if forced in ("W", "B"):
                     team[k] = forced
-            else:
+        for k, I in enumerate(ident):                # odd-colour people who are not keepers are officials
+            if team[k] == "?" and k not in gk_side:
                 team[k] = "O"
     counter = {"W": 0, "B": 0, "?": 0, "O": 0}
     label = {}
     for k in sorted(team, key=lambda k: (team[k], k)):
         counter[team[k]] += 1
-        label[k] = (f"{team[k]}{counter[team[k]]}" + ("-GK" if k in gk_side else "")) if team[k] in ("W", "B") else ("REF" if team[k] == "O" else f"GK-{gk_side.get(k, '?')}")
+        label[k] = (f"{LBL.get(team[k], team[k])}{counter[team[k]]}" + ("-GK" if k in gk_side else "")) if team[k] in ("W", "B") else ("REF" if team[k] == "O" else f"GK-{gk_side.get(k, '?')}")
     print("identities by team:", {t: sum(1 for v in team.values() if v == t) for t in ("W", "B", "?", "O")}, flush=True)
 
-    ball, real, ncand, npath, nstatic = ball_path(rows, ballrows, len(rows))
+    if os.environ.get("BALL_TRACK"):                # Kalman tracker output (ball_kalman.py): only 'det' and short 'interp' steps count as a ball position
+        import csv as _csv
+        pts = {}
+        for r_ in _csv.DictReader(open(os.environ["BALL_TRACK"])):
+            if r_["source"] in ("det", "interp") and r_["x"] != "":
+                pts[int(round(float(r_["frame"])))] = (float(r_["x"]), float(r_["y"]), r_["source"])
+        ball, real_rows = {}, []
+        ks = sorted(pts)
+        for a_, b_ in zip(ks, ks[1:]):
+            if b_ - a_ <= 3:                       # consecutive tracked steps (rows are every 2nd): fill the row in between
+                for f_ in range(a_, b_ + 1):
+                    t_ = (f_ - a_) / (b_ - a_); ball[f_] = (pts[a_][0] * (1 - t_) + pts[b_][0] * t_, pts[a_][1] * (1 - t_) + pts[b_][1] * t_)
+        for k_ in ks:
+            ball[k_] = pts[k_][:2]
+            if pts[k_][2] == "det": real_rows.append(k_)
+        real = np.array(real_rows); ncand, npath, nstatic = len(pts), len(real_rows), 0
+    else:
+        ball, real, ncand, npath, nstatic = ball_path(rows, ballrows, len(rows))
     holder = []
     for fi in range(len(rows)):
         b = ball.get(fi)
@@ -157,6 +244,7 @@ def main():
                 if d < POSSESS_RATIO and (best is None or d < best[0]):
                     best = (d, k)
         holder.append(best[1] if best else None)
+    est, hidden = bridge_ball(ball, real, len(rows), ident, sfps)
     runs, cur, st = [], None, 0
     for i, h in enumerate(holder + [None]):
         if h != cur:
@@ -186,6 +274,27 @@ def main():
                            kind=("pass" if team[a[0]] == team[b[0]] else "turnover") if (team[a[0]] in ("W", "B") and team[b[0]] in ("W", "B")) else "other", team=team[a[0]],
                            frm=label[a[0]], to=label[b[0]], gap_s=round(gap, 2), ball_travel_px=round(travel),
                            frm_row=a[2]))
+    # handovers across a HIDDEN stretch: the ball left one group and came out at another. Counted as 'possible', never as a confirmed pass.
+    possible = []
+    last_run = {k: [r for r in merged if r[0] == k] for k in range(len(ident))}
+    for a, b, ga, gb, gap_s in hidden:
+        if gap_s < 1.0:
+            continue
+        before = [(k, max(r[2] for r in last_run[k] if r[2] <= a)) for k in ga if any(r[2] <= a for r in last_run[k])]
+        after = [(k, min(r[1] for r in last_run[k] if r[1] >= b)) for k in gb if any(r[1] >= b for r in last_run[k])]
+        if not before or not after:
+            continue
+        k0 = max(before, key=lambda x: x[1])[0]; k1 = min(after, key=lambda x: x[1])[0]
+        if k0 == k1:
+            continue
+        possible.append(dict(t_from=round(float(start_s) + a / sfps, 1), t_to=round(float(start_s) + b / sfps, 1), hidden_s=gap_s,
+                             frm=label[k0], to=label[k1], same_team=bool(team[k0] == team[k1] and team[k0] in ("W", "B")),
+                             group_before=[label[k] for k in ga], group_after=[label[k] for k in gb]))
+    if os.environ.get("PASS_EVENTS"):               # touch-based events from pass_events.py replace the hold-based ones
+        lab2team = {I["label"]: I["team"] for I in json.load(open(os.environ["PASS_EVENTS"].replace("pass_events.json", "identities.json"))).values()}
+        events = []
+        for e in json.load(open(os.environ["PASS_EVENTS"])):
+            e = dict(e); e["t"] = round(float(start_s) + e["row"] / sfps, 2); e["team"] = lab2team.get(e["frm"], "?"); events.append(e)
     held = {"W": 0, "B": 0, "?": 0, "O": 0}
     for r in merged:
         held[team[r[0]]] += r[2] - r[1] + 1
@@ -203,8 +312,11 @@ def main():
                    ball=dict(candidates=ncand, path_points=npath, static_spots_removed=nstatic,
                              rows_with_ball_pct=round(100 * len(ball) / len(rows)),
                              rows_with_possession_pct=round(100 * sum(h is not None for h in holder) / len(rows))),
-                   events=events, teams=teams, players=players)
+                   events=events, possible_across_hidden=possible, hidden_stretches=[dict(t0=round(float(start_s) + a / sfps, 1), t1=round(float(start_s) + b / sfps, 1), seconds=g, group_before=[label[k] for k in ga], group_after=[label[k] for k in gb]) for a, b, ga, gb, g in hidden],
+                   teams=teams, players=players)
     (OUT / "passes.json").write_text(json.dumps(summary, indent=1))
+    (OUT / "ball_path.json").write_text(json.dumps({str(f): [round(v[0], 1), round(v[1], 1)] for f, v in ball.items()}))
+    (OUT / "ball_est.json").write_text(json.dumps({str(f): [round(v[0], 1), round(v[1], 1)] for f, v in est.items()}))
     (OUT / "identities.json").write_text(json.dumps({str(k): dict(
         label=label[k], team=team[k], role=("GK" if k in gk_side else ("REF" if team[k] == "O" else "P")),
         rows={str(f): [round(v, 1) for v in o["box"]] + [int(bool(o.get("interp")))] for f, o in I["frames"].items()})
@@ -263,7 +375,7 @@ def main():
                 cv2.line(frame, (tx0, ty0), (tx1, ty1), (0, 0, 255), 1)
         txt = [e for e in events if 0 <= fi - e["row"] <= int(1.5 * sfps)]
         for i, e in enumerate(txt):
-            cv2.putText(frame, f"{e['kind'].upper()} {e['frm']} -> {e['to']}", (12, 80 + 34 * i), 0, 1.0,
+            cv2.putText(frame, f"{e['kind'].upper()}{'?' if e.get('confidence') == 'probable' else ''} {e['frm']} -> {e['to']}", (12, 80 + 34 * i), 0, 1.0,
                         (0, 255, 255), 3)
         cv2.rectangle(frame, (0, 0), (620, 44), (0, 0, 0), -1)
         pw = sum(e["kind"] == "pass" and e["team"] == "W" and e["row"] <= fi for e in events)

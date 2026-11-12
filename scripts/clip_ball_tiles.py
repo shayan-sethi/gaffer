@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ball candidates on very wide frames: the football-ball model on overlapping tiles of the pitch band.
 python clip_ball_tiles.py <out_dir> [every=2] [band_y0=470] [band_y1=930] [conf=0.15]   (resumable; writes ball.jsonl)"""
-import sys, json, time
+import sys, os, json, time
 from pathlib import Path
 import cv2
 import numpy as np
@@ -17,7 +17,7 @@ frames = [r["frame"] for r in rows][::EVERY]
 cache = OUT / "ball.jsonl"
 done = {json.loads(l)["frame"] for l in open(cache)} if cache.exists() else set()
 todo = [f for f in frames if f not in done]
-model = YOLO(r".local_data\models\football-ball-detection.pt")
+model = YOLO(os.environ.get("BALL_WEIGHTS", r".local_data\models\football-ball-detection.pt"))
 cap = cv2.VideoCapture(meta["video"]); t0, k = time.time(), 0
 with open(cache, "a") as out:
     for fi in todo:

@@ -19,6 +19,9 @@ STRIDE = int(sys.argv[5]) if len(sys.argv) > 5 else 2
 Y0 = int(sys.argv[6]) if len(sys.argv) > 6 else 420
 TW = int(sys.argv[7]) if len(sys.argv) > 7 else 1920
 OV = int(sys.argv[8]) if len(sys.argv) > 8 else 240
+import os
+Y1 = int(os.environ.get("Y1", 0))                 # optional: bottom of the picture band (e.g. to skip a letterbox)
+IMGSZ = int(os.environ.get("IMGSZ", 0))           # optional: detector size (bigger = finds smaller people, slower)
 
 
 def torso_rgb(frame, b):
@@ -63,8 +66,8 @@ def main():
                 break
             cand = []
             for x0 in xs:
-                tile = frame[Y0:H, x0:x0 + TW]
-                r = model(tile, imgsz=TW, conf=0.15, classes=[0], verbose=False)[0]
+                tile = frame[Y0:(Y1 or H), x0:x0 + TW]
+                r = model(tile, imgsz=(IMGSZ or TW), conf=0.15, classes=[0], verbose=False)[0]
                 for b, c in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy()):
                     cand.append([float(b[0]) + x0, float(b[1]) + Y0, float(b[2]) + x0, float(b[3]) + Y0, float(c)])
             cand.sort(key=lambda d: -d[4])

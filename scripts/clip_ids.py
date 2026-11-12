@@ -78,6 +78,14 @@ def detect():
 
 
 # ------------------------------------------------------------------ stage 2
+def load_mask(meta):
+    """Pitch region: a saved polygon mask (env PITCH_MASK=path.npy, e.g. drawn by the user) or 'everything'."""
+    pth = os.environ.get("PITCH_MASK")
+    if pth and Path(pth).exists():
+        return np.load(pth).astype(np.uint8)
+    return np.ones((meta["height"], meta["width"]), np.uint8)
+
+
 def pitch_mask_for_window(meta):
     cap = cv2.VideoCapture(VIDEO)
     fr = []
@@ -120,12 +128,30 @@ def track(rows, mask, spots, sfps):
     import supervision as sv
     tr = sv.ByteTrack(track_activation_threshold=0.25, lost_track_buffer=int(2 * sfps),
                       minimum_matching_threshold=0.8, frame_rate=max(1, int(sfps)))
-    per_frame, dropped = [], {"static": 0, "off_pitch": 0, "small": 0}
+    per_frame, dropped = [], {"static": 0, "off_pitch": 0, "small": 0, "excluded": 0}
+    # BIB COLOUR: the one strong colour (hue bin) that many players share, e.g. pink bibs. A single blue shirt does not count.
+    bib_bin = None
+    if SAT_W > 0:
+        B = np.array([d[11:17] for r in rows for d in r["dets"] if len(d) >= 17 and d[8] > -900 and d[4] >= 0.5 and min(d[11:17]) >= 0], float)
+        if len(B) >= 50:
+            cnt = (B >= 0.25).sum(0).astype(float); cnt[[1, 2]] = 0            # bins 1-2 are green: the turf, not a bib
+            if cnt.max() >= 0.15 * len(B):
+                bib_bin = int(np.argmax(cnt))
+                print(f"bib colour: hue bin {bib_bin} ({30 * bib_bin}-{30 * bib_bin + 30} of 180) in {100 * cnt.max() / len(B):.0f}% of detections", flush=True)
+            else:
+                print("no shared bib colour found: teams from shirt colour only", flush=True)
+    # people who are not players (coach, spectator...) can be excluded by shirt colour: EXCLUDE_LAB="L,a,b[;L,a,b]" (+ EXCLUDE_DIST)
+    ex = [np.array([float(v) for v in e.split(",")]) for e in os.environ.get("EXCLUDE_LAB", "").split(";") if e.strip()]
+    ex_dist = float(os.environ.get("EXCLUDE_DIST", 22))
     for r in rows:
         keep = []
         for d in r["dets"]:
             b = d[:4]
-            if b[3] - b[1] < MIN_H:
+            if (EX_MINH and b[3] - b[1] >= EX_MINH) or (EX_BOTTOM and b[3] >= EX_BOTTOM) or (EX_EDGE and (b[0] <= EX_EDGE or b[2] >= mask.shape[1] - EX_EDGE)):
+                dropped["excluded"] += 1                      # very close to the camera / cut off at the bottom edge: a coach or bystander, not a player
+            elif ex and len(d) >= 11 and d[8] > -900 and min(float(np.linalg.norm(np.array(d[8:11]) - e)) for e in ex) < ex_dist:
+                dropped["excluded"] += 1
+            elif b[3] - b[1] < MIN_H:
                 dropped["small"] += 1
             elif is_static(b, spots):
                 dropped["static"] += 1
@@ -146,7 +172,7 @@ def track(rows, mask, spots, sfps):
             j = int(np.argmin(np.abs(a[:, :4] - box).sum(1))) if len(a) else None
             out.append(dict(tid=int(tid), box=[float(v) for v in box], conf=float(cf),
                             rgb=[float(v) for v in a[j, 5:8]] if j is not None else [0, 0, 0],
-                            lab=([float(v) for v in a[j, 8:11]] if (j is not None and a.shape[1] >= 11 and a[j, 8] > -900) else None)))
+                            lab=([float(v) for v in a[j, 8:11]] + ([SAT_W * float(a[j, 11 + bib_bin])] if (SAT_W > 0 and bib_bin is not None and a.shape[1] >= 17 and a[j, 11 + bib_bin] >= 0) else ([0.0] if (SAT_W > 0 and bib_bin is not None) else [])) if (j is not None and a.shape[1] >= 11 and a[j, 8] > -900) else None)))
         per_frame.append(out)
     return per_frame, dropped
 
@@ -163,19 +189,42 @@ def col_dist(a, b):
     return float(np.linalg.norm(np.array(a) - np.array(b)) / 441.7)
 
 
-APP_W = float(os.environ.get("APP_W", 8))     # weight of the appearance-embedding term in link costs
+APP_W = float(os.environ.get("APP_W", 8))
+PRED_W = float(os.environ.get("PRED_W", 0))      # weight of the motion-prediction term in link costs (0 = off)
+SIZE_MAX = float(os.environ.get("SIZE_MAX", 99))   # a returning player must be about the same size: a big near player cannot become a small far one
+SIZE_RATIO_BASE = float(os.environ.get("SIZE_RATIO_BASE", 1.35)); SIZE_RATIO_PER_S = float(os.environ.get("SIZE_RATIO_PER_S", 0.5))   # allowed height ratio between two tracklet ends = base + per_s * gap seconds (0 = off)
+DEDUPE_IOU = float(os.environ.get("DEDUPE_IOU", 0.35))
+SAT_W = float(os.environ.get("SAT_W", 0))                       # weight of the bib-colour share in the team feature (0 = off); bib teams need ~120
+EX_EDGE = float(os.environ.get("EXCLUDE_EDGE_PX", 0))         # exclude boxes cut off by the left/right edge of the picture (a bystander half out of frame)
+EX_MINH = float(os.environ.get("EXCLUDE_MIN_H", 0))          # exclude boxes at least this tall (people right next to the camera)
+EX_BOTTOM = float(os.environ.get("EXCLUDE_BOTTOM_Y", 0))      # exclude boxes whose feet reach this row (cut off by the bottom of the picture)
+_SFPS = 0.0                                       # sampled frames per second, set by lock_identities     # weight of the appearance-embedding term in link costs
 
 
 def link_cost(a_end, b_start, gap_s, ea=None, ec=None):
     """cost of saying 'the person at a_end (a frame) later reappears at b_start'; None if impossible.
     ea / ec: optional appearance embeddings (unit vectors) of the two tracklets - a soft extra cost, never a veto."""
-    h = max(np.median([height(o) for o in a_end[-5:]]), np.median([height(o) for o in b_start[:5]]))
+    ha_, hb_ = np.median([height(o) for o in a_end[-5:]]), np.median([height(o) for o in b_start[:5]])
+    h = min(ha_, hb_) if SIZE_RATIO_BASE > 0 else max(ha_, hb_)         # reach is judged by the SMALLER of the two, so a big near player cannot 'reach' a far small one
+    if max(ha_, hb_) / max(min(ha_, hb_), 1e-6) > min(SIZE_MAX, SIZE_RATIO_BASE + SIZE_RATIO_PER_S * gap_s if SIZE_RATIO_BASE > 0 else SIZE_MAX):
+        return None                                                    # a player's apparent size changes slowly: near and far are different people
     dist = float(np.linalg.norm(foot(a_end[-1]) - foot(b_start[0])))
     allow = h * (0.6 + 2.0 * gap_s)
     cd = col_dist(np.median([o["rgb"] for o in a_end[-8:]], 0), np.median([o["rgb"] for o in b_start[:8]], 0))
     if dist > allow or cd > 0.40:
         return None
     cost = gap_s + dist / h / 2 + 3 * cd
+    if PRED_W > 0 and len(a_end) >= 5 and len(b_start) >= 5 and _SFPS:
+        # motion check: where would A have been by the time B starts (and where would B have been when A ended)?
+        # Two same-shirt players who cross keep their own direction of travel, so the wrong pairing predicts badly.
+        k = min(6, len(a_end), len(b_start))
+        va = (foot(a_end[-1]) - foot(a_end[-k])) / ((k - 1) / _SFPS)
+        vb = (foot(b_start[k - 1]) - foot(b_start[0])) / ((k - 1) / _SFPS)
+        cap = 2.5 * h                                                   # px/s: a player does not run faster than this in body-heights
+        va = va * min(1.0, cap / max(np.linalg.norm(va), 1e-6)); vb = vb * min(1.0, cap / max(np.linalg.norm(vb), 1e-6))
+        e_f = np.linalg.norm(foot(a_end[-1]) + va * gap_s - foot(b_start[0]))
+        e_b = np.linalg.norm(foot(b_start[0]) - vb * gap_s - foot(a_end[-1]))
+        cost += PRED_W * 0.5 * (e_f + e_b) / h
     if ea is not None and ec is not None:
         cost += APP_W * (1.0 - float(ea @ ec))
     return cost
@@ -219,6 +268,36 @@ def split_on_shirt_change(tracks, win=9, min_run=8):
             merged = merged[1:]
         for j, (a, b2, _) in enumerate(merged):
             out[tid * 1000 + j] = seq[a:b2]
+    return out
+
+
+def split_on_bib_change(tracks, win=9, min_run=8, thr=0.10):
+    """ByteTrack sometimes carries one ID from a bib player to a non-bib player (or back) when they overlap. With a bib colour known
+    (o["lab"][3] = SAT_W * bib share), cut a tracklet where its bib share flips and stays flipped for >= min_run samples, so no
+    identity can hold both a bib and a non-bib player."""
+    if SAT_W <= 0:
+        return tracks
+    out = {}
+    for tid, seq in tracks.items():
+        sh = np.array([(o["lab"][3] / SAT_W) if (o.get("lab") is not None and len(o["lab"]) >= 4) else np.nan for _, o in seq])
+        if np.isnan(sh).mean() > 0.6 or len(seq) < 2 * min_run:
+            out[tid] = seq; continue
+        sh = np.where(np.isnan(sh), np.nanmedian(sh), sh)
+        m = np.array([np.median(sh[max(0, i - win // 2):i + win // 2 + 1]) for i in range(len(sh))])
+        cls = (m >= thr).astype(int); runs, st = [], 0
+        for i in range(1, len(cls) + 1):
+            if i == len(cls) or cls[i] != cls[st]:
+                runs.append([st, i, int(cls[st])]); st = i
+        merged = []
+        for r in runs:
+            if merged and (r[1] - r[0] < min_run or merged[-1][2] == r[2]):
+                merged[-1][1] = r[1]
+            else:
+                merged.append(r)
+        if len(merged) > 1 and merged[0][1] - merged[0][0] < min_run:
+            merged[1][0] = merged[0][0]; merged = merged[1:]
+        for j, (a, b, _) in enumerate(merged):
+            out[tid * 100 + j] = seq[a:b]
     return out
 
 
@@ -417,6 +496,42 @@ class SigEmbedder:
         return m / np.linalg.norm(m)
 
 
+def classify_teams(X):
+    """X: (n, 3) Lab shirt colours. Two teams by 2-means (lighter = 'W'); a shirt that is far from BOTH team
+    colours (farther than 0.9 x the distance between the teams, e.g. a yellow keeper) is 'X' (odd colour)."""
+    X = np.asarray(X, np.float32)
+    if len(X) < 3:
+        return ["W"] * len(X)
+    cv2.setRNGSeed(0)
+    _, lab, cen = cv2.kmeans(X, 2, None, (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-4), 20, cv2.KMEANS_PP_CENTERS)
+    lab = lab.ravel()
+    light = int(np.argmax(cen[:, 0]))
+    between = float(np.linalg.norm(cen[0] - cen[1]))
+    out = []
+    for x, l in zip(X, lab):
+        d = float(np.linalg.norm(x - cen[int(l)]))
+        out.append("X" if d > 0.9 * between else ("W" if int(l) == light else "B"))
+    return out
+
+
+def enforce_team_size(ident, ts):
+    """Players per side is known (e.g. 6v6): the `ts` identities with the most bib colour (4th element of o["lab"]) are the bib team ('W'), the rest 'B'.
+    Only applies when there are exactly 2*ts identities and a bib colour was found."""
+    if not ts or len(ident) != 2 * ts:
+        return False
+    share = []
+    for I in ident:
+        v = [o["lab"][3] for o in I["frames"].values() if o.get("lab") is not None and len(o["lab"]) >= 4 and not o.get("interp")]
+        share.append(float(np.median(v)) if v else -1.0)
+    if max(share) <= 0:
+        return False
+    top = set(int(k) for k in np.argsort(-np.array(share))[:ts])
+    for k, I in enumerate(ident):
+        I["team"] = "W" if k in top else "B"
+        I["cls"] = I["team"]
+    return True
+
+
 def reteam(video, rows, ident, per=12):
     """Re-decide the teams of locked identities from the cached grass-free shirt colours (o["lab"]).
     Light vs dark/blue = the two biggest of 3 colour groups; a small odd group (keepers / officials) gets '?'."""
@@ -428,15 +543,8 @@ def reteam(video, rows, ident, per=12):
         if len(v) >= 3:
             cols[k] = np.median(np.array(v), axis=0)
     ks = list(cols)
-    X = np.array([cols[k] for k in ks], np.float32)
-    cv2.setRNGSeed(0)
-    _, lab_, cen = cv2.kmeans(X, 3, None, (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-4), 20, cv2.KMEANS_PP_CENTERS)
-    lab_ = lab_.ravel()
-    sizes = np.bincount(lab_, minlength=3)
-    team_ids = sorted(np.argsort(-sizes)[:2], key=lambda c: -cen[c][0])      # lighter first
-    name = {int(team_ids[0]): "W", int(team_ids[1]): "B"}
-    for k, l_ in zip(ks, lab_):
-        ident[k]["team"] = name.get(int(l_), "?")
+    for k, c in zip(ks, classify_teams([cols[k] for k in ks])):
+        ident[k]["team"] = "?" if c == "X" else c
         ident[k]["cls"] = ident[k]["team"]
     return {k: cols[k] for k in ks}
 
@@ -453,6 +561,71 @@ class TrackletColour:
         return np.median(np.array(v), axis=0) if len(v) >= 2 else None
 
 
+def _iou_box(a, b):
+    iw, ih = min(a[2], b[2]) - max(a[0], b[0]), min(a[3], b[3]) - max(a[1], b[1])
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    i = iw * ih
+    return i / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - i)
+
+
+def _continuity(I, f):
+    """how far the box at frame f jumps from the identity's previous box (in body-heights): small = it really is the same person"""
+    o = I["frames"][f]
+    for p in range(f - 1, f - 6, -1):
+        q = I["frames"].get(p)
+        if q is not None and not q.get("interp"):
+            h = max(height(o), height(q))
+            return float(np.linalg.norm(foot(o) - foot(q))) / h + abs(height(o) - height(q)) / h
+    return 0.5
+
+
+def dedupe_same_person(ident, thr):
+    """One person, one identity: if two same-team identities have heavily overlapping boxes in the same frame, one of them has been
+    pulled onto the other's player. The one whose box jumps more from its own previous position loses that frame (left as a gap)."""
+    dropped, n = 0, len(ident)
+    for f in sorted({f for I in ident for f in I["frames"]}):
+        for i in range(n):
+            oi = ident[i]["frames"].get(f)
+            if oi is None:
+                continue
+            for j in range(i + 1, n):
+                if ident[i]["cls"] != ident[j]["cls"]:
+                    continue
+                oj = ident[j]["frames"].get(f)
+                if oj is None or _iou_box(oi["box"], oj["box"]) <= thr:
+                    continue
+                loser = i if _continuity(ident[i], f) > _continuity(ident[j], f) else j
+                ident[loser]["frames"].pop(f, None)
+                dropped += 1
+                if loser == i:
+                    break
+    return dropped
+
+
+BIB_HARD = os.environ.get("BIB_HARD", "1") == "1"      # with a bib colour known, the bib decides the team of every tracklet (hard split), not a soft 2-means
+
+
+def tracklet_bib_share(seq):
+    v = [o["lab"][3] / SAT_W for _, o in seq if o.get("lab") is not None and len(o["lab"]) >= 4]
+    return float(np.median(v)) if v else float("nan")
+
+
+def otsu_bib_threshold(tracks):
+    """data-driven split between 'wears the bib' and 'does not': Otsu on per-frame bib shares, kept in a sane band (fog lowers far bibs)"""
+    v = np.array([o["lab"][3] / SAT_W for seq in tracks.values() for _, o in seq if o.get("lab") is not None and len(o["lab"]) >= 4])
+    if len(v) < 50:
+        return 0.2
+    best, bt = -1.0, 0.2
+    for t in np.linspace(0.05, 0.45, 41):
+        lo, hi = v[v < t], v[v >= t]
+        if len(lo) and len(hi):
+            w0, w1 = len(lo) / len(v), len(hi) / len(v); sc = w0 * w1 * (lo.mean() - hi.mean()) ** 2
+            if sc > best:
+                best, bt = sc, float(t)
+    return float(min(max(bt, 0.12), 0.35))
+
+
 def lock_identities(per_frame, sfps, embedder=None, colourer=None):
     """Exact assignment instead of greedy matching.
 
@@ -462,11 +635,17 @@ def lock_identities(per_frame, sfps, embedder=None, colourer=None):
     right ones later. Tracklets on no path are returned as `unassigned` (bystanders, extra people).
     """
     import networkx as nx
+    global _SFPS
+    _SFPS = sfps
     tracks = {}
     for fi, out in enumerate(per_frame):
         for o in out:
             tracks.setdefault(o["tid"], []).append((fi, o))
     tracks = split_on_shirt_change(tracks)
+    bib_thr = otsu_bib_threshold(tracks) if (SAT_W > 0 and BIB_HARD) else None
+    tracks = split_on_bib_change(tracks, thr=bib_thr) if bib_thr is not None else split_on_bib_change(tracks)
+    if bib_thr is not None:
+        print(f"bib threshold (Otsu on bib share): {bib_thr:.2f}", flush=True)
     tl = {t: s for t, s in tracks.items() if len(s) >= MIN_TRACK}
     ids = sorted(tl, key=lambda t: tl[t][0][0])
     # team class of each tracklet: length-weighted 2-means on median torso colour in Lab (lightness + chroma),
@@ -475,16 +654,14 @@ def lock_identities(per_frame, sfps, embedder=None, colourer=None):
     for t in ids:
         f_ = colourer(tl[t]) if colourer is not None else None
         feat[t] = f_ if f_ is not None else lab_feature(np.median([o["rgb"] for _, o in tl[t]], axis=0))
-    X = np.array([feat[t] for t in ids], np.float32)
-    cv2.setRNGSeed(0)
-    _, lab_, cen = cv2.kmeans(X, 3, None, (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-4), 20, cv2.KMEANS_PP_CENTERS)
-    lab_ = lab_.ravel()
-    wts = np.array([len(tl[t]) for t in ids], float)
-    size_ = np.array([wts[lab_ == c].sum() for c in range(3)])
-    two = sorted(np.argsort(-size_)[:2], key=lambda c: -cen[c][0])           # lighter first
-    nm = {int(two[0]): "W", int(two[1]): "B"}
-    team_of = {t: nm.get(int(l_), "X") for t, l_ in zip(ids, lab_)}           # X = odd colour (keeper, referee)
-    class_centre = {"W": cen[two[0]], "B": cen[two[1]], "X": cen[[c for c in range(3) if c not in two][0]]}
+    team_of = dict(zip(ids, classify_teams([feat[t] for t in ids])))          # W / B / X (odd colour)
+    if bib_thr is not None:                                                    # the bib is the strongest cue: it decides the team, nothing else can overrule it
+        for t in ids:
+            sh = tracklet_bib_share(tl[t])
+            team_of[t] = "W" if (sh == sh and sh >= bib_thr) else "B"
+    _w = [t for t in ids if team_of[t] == "W"]; _b = [t for t in ids if team_of[t] == "B"]; _x = [t for t in ids if team_of[t] == "X"]
+    _m = lambda L: np.mean([feat[t] for t in L], axis=0) if L else np.zeros(3)
+    class_centre = {"W": _m(_w), "B": _m(_b), "X": _m(_x)}
     tracklet_emb = {t: embedder(tl[t]) for t in ids} if embedder is not None else {}
     tracklet_feat = feat
     FRAME_REWARD, LINK_W, MAX_GAP = 100, 400, int(8 * sfps)
@@ -496,9 +673,13 @@ def lock_identities(per_frame, sfps, embedder=None, colourer=None):
     G.add_node("S", demand=-K)
     G.add_node("T", demand=K)
     G.add_edge("S", "T", capacity=K, weight=0)
+    TS = int(os.environ.get("TEAM_SIZE", 0))
+    per_class = bib_thr is not None and TS > 0              # bib known and squad size known: each colour class gets its own slots, so one class cannot starve the other
+    if per_class:
+        G.add_edge("S", "SW", capacity=TS + EXTRA, weight=0); G.add_edge("S", "SB", capacity=TS + EXTRA, weight=0)
     for t in ids:
         G.add_edge(("in", t), ("out", t), capacity=1, weight=-FRAME_REWARD * len(tl[t]))
-        G.add_edge("S", ("in", t), capacity=1, weight=START_COST)
+        G.add_edge(("SW" if team_of[t] == "W" else "SB") if per_class else "S", ("in", t), capacity=1, weight=START_COST)
         G.add_edge(("out", t), "T", capacity=1, weight=0)
     for a_ in ids:
         for c_ in ids:
@@ -517,7 +698,8 @@ def lock_identities(per_frame, sfps, embedder=None, colourer=None):
             if f and node != "T":
                 nxt[a_] = node[1]
     ident, used = [], set()
-    for t in [t for t in ids if flow["S"].get(("in", t), 0)]:
+    starts = lambda t: flow[("SW" if team_of[t] == "W" else "SB") if per_class else "S"].get(("in", t), 0)
+    for t in [t for t in ids if starts(t)]:
         ch, cur = [t], t
         while cur in nxt:
             cur = nxt[cur]
@@ -529,6 +711,9 @@ def lock_identities(per_frame, sfps, embedder=None, colourer=None):
             used.add(tt)
         ident.append(dict(frames=frames, tids=ch, cls=team_of[ch[0]],
                           feat=np.average([tracklet_feat[tt] for tt in ch], axis=0, weights=[len(tl[tt]) for tt in ch])))
+    n_dup = dedupe_same_person(ident, DEDUPE_IOU) if DEDUPE_IOU > 0 else 0
+    if n_dup:
+        print(f"one-person-one-identity: removed {n_dup} doubled boxes", flush=True)
     flag_officials(ident, class_centre)
     assign_roles(ident)
     unassigned = [(dict((fi, o) for fi, o in tl[t]), [t]) for t in ids if t not in used]

@@ -9,6 +9,8 @@ import sys, json, shutil
 from pathlib import Path
 import numpy as np
 import cv2
+import os
+BIB_S = int(os.environ.get("BIB_S", 110)); BIB_V = int(os.environ.get("BIB_V", 110))      # a bib needs at least this saturation / brightness (fog washes out far bibs: use ~70/100)
 OUT = Path(sys.argv[1])
 meta = json.load(open(OUT / "meta.json"))
 rows = [json.loads(l) for l in open(OUT / "dets.jsonl")]
@@ -39,7 +41,7 @@ while fi <= last:
         for d in by[fi]["dets"]:
             x1, y1, x2, y2 = [int(v) for v in d[:4]]
             h, w = y2 - y1, x2 - x1
-            lab = [-999, -999, -999]
+            lab = [-999, -999, -999]; t = np.zeros(0); hsv = None
             if h >= 22:
                 t = im[max(0, y1 + int(.18 * h)):y1 + int(.55 * h), max(0, x1 + int(.2 * w)):x2 - int(.2 * w)]
                 if t.size:
@@ -47,7 +49,11 @@ while fi <= last:
                     px = t.reshape(-1, 3)[~((hsv[:, 0] >= 30) & (hsv[:, 0] <= 95) & (hsv[:, 1] > 35))]
                     if len(px) >= 6:
                         lab = lab_feature(np.median(px, axis=0)[::-1])
-            d[:] = d[:8] + lab
+            sat = [-1.0] * 6                                # share of the torso that is a strong colour, split into 6 hue bins of 30 degrees (OpenCV hue 0..180)
+            if h >= 22 and t.size:
+                sm = (hsv[:, 1] >= BIB_S) & (hsv[:, 2] >= BIB_V)
+                sat = [round(float((sm & (hsv[:, 0] >= 30 * k) & (hsv[:, 0] < 30 * k + 30)).mean()), 3) for k in range(6)]
+            d[:] = d[:8] + lab + sat
         n += 1
         if n % 50 == 0:
             print(n, "frames", flush=True)
