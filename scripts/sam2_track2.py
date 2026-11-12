@@ -131,7 +131,7 @@ def collect(fi, oids, logits):
 
 
 with torch.inference_mode(), device.autocast(dev):
-    st = pred.init_state(video_path=str(FR), offload_video_to_cpu=True, offload_state_to_cpu=True)
+    st = pred.init_state(video_path=str(FR), offload_video_to_cpu=True, offload_state_to_cpu=os.environ.get("OFFLOAD_STATE", "1") == "1")   # OFFLOAD_STATE=0 keeps SAM 2's working data on the GPU (faster; needs the memory trimming below)
     for oi, b in enumerate(seeds):
         pred.add_new_points_or_box(st, frame_idx=SEED, obj_id=oi, box=np.array([b[0], b[1] - Y0, b[2], b[3] - Y0], np.float32))
     if SEED > 0:
