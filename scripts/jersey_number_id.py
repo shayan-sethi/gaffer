@@ -24,9 +24,9 @@ from strhub.models.parseq.system import PARSeq
 from strhub.data.module import SceneTextDataModule
 
 MATCH_ID = "073a9f18-b3cd-4658-9a75-f45398eee6c8"
-DB_PATH = r".local_data\gaffer_test.db"
+DB_PATH = r".local_data/gaffer_test.db"
 VIDEO_PATH = r"test_videos\Barcelona vs Espanyol 2-1 1st half Tactical Cam - CameraTattica (1080p).mp4"
-CKPT_PATH = r".local_data\models\parseq_soccernet.ckpt"
+CKPT_PATH = r".local_data/models/parseq_soccernet.ckpt"
 NUM_SAMPLES = 20
 MIN_CONFIDENCE = 0.95
 

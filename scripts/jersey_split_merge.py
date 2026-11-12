@@ -33,9 +33,9 @@ from app.cv.calibration import PitchCalibration
 
 MATCH_ID = sys.argv[1]
 PICKLE_PATH = sys.argv[2]
-DB_PATH = r".local_data\gaffer_test.db"
+DB_PATH = r".local_data/gaffer_test.db"
 VIDEO_PATH = r"test_videos\Barcelona vs Espanyol 2-1 1st half Tactical Cam - CameraTattica (1080p).mp4"
-CKPT_PATH = r".local_data\models\parseq_soccernet.ckpt"
+CKPT_PATH = r".local_data/models/parseq_soccernet.ckpt"
 BOUNDARY_RESULTS_PATH = r"C:\Users\SHAYAN~1\AppData\Local\Temp\claude\C--Users-Shayan-Sethi-gaffer\83fe6ffb-4aa4-48f0-bbd5-333435412950\scratchpad\pitch_boundary_results.json"
 SIGLIP_ASSIGNMENT_PATH = r"C:\Users\SHAYAN~1\AppData\Local\Temp\claude\C--Users-Shayan-Sethi-gaffer\83fe6ffb-4aa4-48f0-bbd5-333435412950\scratchpad\siglip_team_assignment.json"
 READS_OUT_PATH = r"C:\Users\SHAYAN~1\AppData\Local\Temp\claude\C--Users-Shayan-Sethi-gaffer\83fe6ffb-4aa4-48f0-bbd5-333435412950\scratchpad\dense_jersey_reads.json"

@@ -41,9 +41,10 @@ for l in labels:
             cv2.imwrite(str(OUT / "ds" / "images" / "train" / f"{l['i']:04d}_neg.jpg"), im[oy:oy + win, ox:ox + win]); open(OUT / "ds" / "labels" / "train" / f"{l['i']:04d}_neg.txt", "w").write(""); break
 open(OUT / "data.yaml", "w").write(f"path: {(OUT / 'ds').resolve().as_posix()}\ntrain: images/train\nval: images/val\nnames:\n  0: ball\n")
 print(f"dataset: {n_tr} train images, {n_va} val images", flush=True)
+sys.path.insert(0, str(Path(__file__).resolve().parent)); import device
 from ultralytics import YOLO
-base = os.environ.get("BASE", r".local_data\models\football-ball-detection.pt")
+base = os.environ.get("BASE", r".local_data/models/football-ball-detection.pt")
 m = YOLO(base)
-m.train(data=str(OUT / "data.yaml"), epochs=EP, imgsz=640, batch=16, device=os.environ.get("DEVICE", 0), project=str(OUT.resolve()), name="run", exist_ok=True,
+m.train(data=str(OUT / "data.yaml"), epochs=EP, imgsz=640, batch=16, device=(os.environ.get("DEVICE") or device.yolo_device()), project=str(OUT.resolve()), name="run", exist_ok=True,
         degrees=0, shear=0, perspective=0, flipud=0, fliplr=0.5, mosaic=0.3, scale=0.4, hsv_h=0.015, hsv_s=0.5, hsv_v=0.4, patience=20, workers=0, verbose=False, plots=False)
 print("weights:", OUT / "run" / "weights" / "best.pt")

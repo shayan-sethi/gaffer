@@ -16,7 +16,7 @@ NF = int(sys.argv[5]) if len(sys.argv) > 5 else 300
 HOLD = (float(sys.argv[6]), float(sys.argv[7])) if len(sys.argv) > 7 else (-1, -1)
 CONF = float(os.environ.get("CONF", 0.45))
 (OUT / "raw").mkdir(parents=True, exist_ok=True)
-model = YOLO(os.environ.get("BALL_WEIGHTS", r".local_data\models\football-ball-detection.pt"))
+model = YOLO(os.environ.get("BALL_WEIGHTS", r".local_data/models/football-ball-detection.pt"))
 cap = cv2.VideoCapture(V); fps = cap.get(5); n = int(cap.get(7)); W = int(cap.get(3))
 random.seed(7)
 cand = [f for f in range(int(fps * 120), int(n - fps * 30), 1) if not (HOLD[0] * fps <= f <= HOLD[1] * fps)]

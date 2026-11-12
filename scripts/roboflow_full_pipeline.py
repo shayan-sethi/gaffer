@@ -40,8 +40,8 @@ OUT_DIR = sys.argv[2]
 MAX_FRAMES = int(sys.argv[3]) if len(sys.argv) > 3 else None
 os.makedirs(OUT_DIR, exist_ok=True)
 
-PLAYER_MODEL = r".local_data\models\football-player-detection.pt"
-PITCH_MODEL = r".local_data\models\football-pitch-detection.pt"
+PLAYER_MODEL = r".local_data/models/football-player-detection.pt"
+PITCH_MODEL = r".local_data/models/football-pitch-detection.pt"
 BALL, GOALKEEPER, PLAYER, REFEREE = 0, 1, 2, 3
 CONF = 0.3
 KEYPOINT_CONF = 0.5

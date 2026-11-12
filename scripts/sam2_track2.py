@@ -13,7 +13,8 @@ import sys, os, json, time
 from pathlib import Path
 import numpy as np, cv2, torch
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(next((ROOT / ".local_data/ext/sam2_src").glob("sam2-*"))))
+sys.path.insert(0, str(Path(__file__).resolve().parent)); import device
+device.add_sam2_to_path()
 from sam2.build_sam import build_sam2_video_predictor
 
 D = Path(sys.argv[1]); Y1 = int(sys.argv[2]); MINH = float(sys.argv[3]) if len(sys.argv) > 3 else 70
@@ -114,8 +115,8 @@ def colour(row, b):                                    # torso colour of a box o
 
 
 ref = {oi: colour(SEED, b) for oi, b in enumerate(seeds)}; ref_h = {oi: b[3] - b[1] for oi, b in enumerate(seeds)}
-dev = "cuda"
-pred = build_sam2_video_predictor("configs/sam2.1/sam2.1_hiera_s.yaml", str(ROOT / ".local_data/ext/sam2_ckpt/sam2.1_hiera_small.pt"), device=dev)
+dev = device.pick_device(); print("device:", dev, flush=True)
+pred = build_sam2_video_predictor("configs/sam2.1/sam2.1_hiera_s.yaml", device.sam2_checkpoint(), device=dev)
 res, log = {}, []
 
 
@@ -129,7 +130,7 @@ def collect(fi, oids, logits):
             del res[fi][int(oi)]
 
 
-with torch.inference_mode(), torch.autocast(dev, dtype=torch.bfloat16):
+with torch.inference_mode(), device.autocast(dev):
     st = pred.init_state(video_path=str(FR), offload_video_to_cpu=True, offload_state_to_cpu=True)
     for oi, b in enumerate(seeds):
         pred.add_new_points_or_box(st, frame_idx=SEED, obj_id=oi, box=np.array([b[0], b[1] - Y0, b[2], b[3] - Y0], np.float32))

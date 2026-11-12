@@ -21,7 +21,7 @@ VIDEO = sys.argv[1]
 OUT_DIR = sys.argv[2]
 os.makedirs(OUT_DIR, exist_ok=True)
 
-PLAYER_MODEL = r".local_data\models\football-player-detection.pt"
+PLAYER_MODEL = r".local_data/models/football-player-detection.pt"
 BALL, GOALKEEPER, PLAYER, REFEREE = 0, 1, 2, 3
 CONF = 0.3
 STRIDE = 30  # frames sampled to fit the team classifier

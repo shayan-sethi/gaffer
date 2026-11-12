@@ -1,0 +1,5 @@
+# Keep shell scripts and Python on LF everywhere: a .sh file with CRLF line endings fails on a Mac / Linux.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf

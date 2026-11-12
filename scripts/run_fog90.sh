@@ -2,7 +2,7 @@
 # Full pipeline on a longer stretch of the fog clip (6v6, pink bibs vs no bibs). One chain, logs each stage with a timestamp.
 # usage: bash scripts/run_fog90.sh <start_s> <seconds> <out_dir>
 set -e
-cd "C:/Users/Shayan Sethi/gaffer"
+cd "$(dirname "$0")/.."
 START=${1:-35}; SECS=${2:-90}; D=${3:-.local_data/fog_90s}
 V="test_videos/Saturday Morning Football in Heavy Fog 10am Match Highlights 7th November 2026 Eltham Goals.mp4"
 GPU=.local_data/venv_gpu/Scripts/python.exe

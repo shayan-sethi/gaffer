@@ -30,7 +30,7 @@ from app.cv.calibration import PitchCalibration
 
 MATCH_ID = sys.argv[1]
 PICKLE_PATH = sys.argv[2]
-DB_PATH = r".local_data\gaffer_test.db"
+DB_PATH = r".local_data/gaffer_test.db"
 VIDEO_PATH = r"test_videos\Barcelona vs Espanyol 2-1 1st half Tactical Cam - CameraTattica (1080p).mp4"
 CROPS_PER_TRACK = 20
 # How far (in the fitted KMeans's own distance units) an embedding can sit

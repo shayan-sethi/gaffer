@@ -12,7 +12,7 @@ from ultralytics import YOLO
 V, OUT, Y0, Y1 = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 NS = int(sys.argv[5]) if len(sys.argv) > 5 else 40; SHARE = float(sys.argv[6]) if len(sys.argv) > 6 else 0.25
 TILE_W = int(os.environ.get("TILE_W", 0))
-model = YOLO(os.environ.get("BALL_WEIGHTS", r".local_data\models\football-ball-detection.pt"))
+model = YOLO(os.environ.get("BALL_WEIGHTS", r".local_data/models/football-ball-detection.pt"))
 cap = cv2.VideoCapture(V); n = int(cap.get(7)); W = int(cap.get(3))
 xs = [0] if not TILE_W or W <= TILE_W else sorted(set(list(range(0, W - TILE_W + 1, TILE_W - 128)) + [W - TILE_W])); tw = W if not TILE_W else min(TILE_W, W)
 pts = []

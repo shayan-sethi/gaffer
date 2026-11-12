@@ -20,7 +20,7 @@ cache = OUT / "ball.jsonl"
 done = {json.loads(l)["frame"] for l in open(cache)} if cache.exists() else set()
 todo = [f for f in frames if f not in done]
 coco = YOLO("yolov8n.pt")
-ballm = YOLO(r".local_data\models\football-ball-detection.pt")
+ballm = YOLO(r".local_data/models/football-ball-detection.pt")
 cap = cv2.VideoCapture(meta["video"])
 t0, k = time.time(), 0
 with open(cache, "a") as out:

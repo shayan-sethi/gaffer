@@ -17,7 +17,7 @@ frames = list(range(first, last + 1, STEP))
 cache = OUT / "ball_hi.jsonl"
 done = {json.loads(l)["frame"] for l in open(cache)} if cache.exists() else set()
 todo = [f for f in frames if f not in done]
-model = YOLO(os.environ.get("BALL_WEIGHTS", r".local_data\models\football-ball-detection.pt"))
+model = YOLO(os.environ.get("BALL_WEIGHTS", r".local_data/models/football-ball-detection.pt"))
 TILE_W = int(os.environ.get("TILE_W", 0))      # >0: cut the band into native-resolution tiles of this width (a small ball stays full size); 0: whole width, shrunk to <=1920
 
 

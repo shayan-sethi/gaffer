@@ -22,8 +22,8 @@ from sports.common.view import ViewTransformer
 from sports.configs.soccer import SoccerPitchConfiguration
 
 VIDEO, OUT = sys.argv[1], sys.argv[2]
-PLAYER_MODEL = r".local_data\models\football-player-detection.pt"
-PITCH_MODEL = r".local_data\models\football-pitch-detection.pt"
+PLAYER_MODEL = r".local_data/models/football-player-detection.pt"
+PITCH_MODEL = r".local_data/models/football-pitch-detection.pt"
 BALL = 0
 CONF = 0.3
 KEYPOINT_CONF = 0.5

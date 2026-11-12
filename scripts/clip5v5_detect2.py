@@ -34,7 +34,7 @@ def torso_rgb(frame, b):
 
 def main():
     coco = YOLO("yolov8n.pt")
-    ballm = YOLO(r".local_data\models\football-ball-detection.pt")
+    ballm = YOLO(r".local_data/models/football-ball-detection.pt")
     cap = cv2.VideoCapture(meta["video"])
     t0, n = time.time(), 0
     todo = [r for r in base if r["frame"] not in done]

@@ -18,7 +18,8 @@ PAL = [(255,120,120),(120,255,120),(120,120,255),(255,255,120),(255,120,255),(12
 PC = {I["label"]: PAL[i % len(PAL)] for i, I in enumerate(ids.values())}
 colof = lambda I: COL[I["team"]] if I["team"] in COL else PC[I["label"]]
 cap = cv2.VideoCapture(meta["video"]); cap.set(cv2.CAP_PROP_POS_FRAMES, meta["start_frame"])
-vw = cv2.VideoWriter(str(OUTF), cv2.VideoWriter_fourcc(*"VP80"), sfps, (int(W * S), int((Y1 - Y0) * S)))
+sys.path.insert(0, str(Path(__file__).resolve().parent)); import device
+vw, OUTF = device.video_writer(OUTF, sfps, (int(W * S), int((Y1 - Y0) * S)))
 trail = []
 for r in range(N):
     ok, im = cap.read()

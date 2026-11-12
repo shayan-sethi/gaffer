@@ -1,0 +1,17 @@
+# Packages for the video pipeline in scripts/ (run_clip.sh and friends). Versions are the ones it was developed with (Windows, Python 3.9, CUDA 12.6).
+# torch / torchvision: install the build for your machine FIRST (https://pytorch.org/get-started/locally/):
+#   Mac (Apple silicon):  pip install torch torchvision          (the default wheel includes MPS)
+#   Windows + NVIDIA:     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# SAM 2 needs Python >= 3.10 officially:  pip install git+https://github.com/facebookresearch/sam2.git
+numpy>=1.26
+opencv-python>=4.7
+ultralytics>=8.3
+supervision>=0.25
+scipy>=1.11
+networkx>=3.2
+matplotlib>=3.8
+scikit-learn>=1.4
+pillow>=10
+tqdm
+hydra-core>=1.3.2
+iopath>=0.1.10

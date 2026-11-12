@@ -10,7 +10,8 @@ import sys, os, json, time
 from pathlib import Path
 import numpy as np, cv2, torch
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(next((ROOT / ".local_data/ext/sam2_src").glob("sam2-*"))))
+sys.path.insert(0, str(Path(__file__).resolve().parent)); import device
+device.add_sam2_to_path()
 from sam2.build_sam import build_sam2_video_predictor
 
 D = Path(sys.argv[1]); N = int(sys.argv[2]); SEED = int(sys.argv[3]) if len(sys.argv) > 3 else None
@@ -47,10 +48,10 @@ if len(list(FR.glob("*.jpg"))) < N:
         for _ in range(meta["stride"] - 1):
             cap.grab()
 print(f"{N} frames ready ({time.time() - t0:.0f}s)", flush=True)
-dev = "cuda"
-pred = build_sam2_video_predictor("configs/sam2.1/sam2.1_hiera_s.yaml", str(ROOT / ".local_data/ext/sam2_ckpt/sam2.1_hiera_small.pt"), device=dev)
+dev = device.pick_device(); print("device:", dev, flush=True)
+pred = build_sam2_video_predictor("configs/sam2.1/sam2.1_hiera_s.yaml", device.sam2_checkpoint(), device=dev)
 res = {}                                               # row -> {obj: [x1,y1,x2,y2]}
-with torch.inference_mode(), torch.autocast(dev, dtype=torch.bfloat16):
+with torch.inference_mode(), device.autocast(dev):
     st = pred.init_state(video_path=str(FR), offload_video_to_cpu=True, offload_state_to_cpu=True)
     for oi, k in enumerate(keys):
         b = seeds[k]["rows"][str(SEED)]
@@ -63,7 +64,7 @@ with torch.inference_mode(), torch.autocast(dev, dtype=torch.bfloat16):
                 if len(xs) > 20:
                     res.setdefault(fi, {})[int(oi)] = [float(xs.min()), float(ys.min() + Y0), float(xs.max()), float(ys.max() + Y0)]
             if fi % 40 == 0:
-                print(f"  {'back' if rev else 'fwd '} row {fi} ({time.time() - t0:.0f}s, GPU {torch.cuda.max_memory_allocated() / 1e9:.1f} GB)", flush=True)
+                print(f"  {'back' if rev else 'fwd '} row {fi} ({time.time() - t0:.0f}s, GPU {device.gpu_mem(dev):.1f} GB)", flush=True)
 print(f"tracking done ({time.time() - t0:.0f}s)", flush=True)
 
 # bib share per object per row (from the detection that overlaps the mask box most)

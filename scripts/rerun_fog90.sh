@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Re-run everything after detection (cached): identities -> passes -> report -> video.   bash scripts/rerun_fog90.sh <start_s> <seconds> <out_dir>
 set -e
-cd "C:/Users/Shayan Sethi/gaffer"
+cd "$(dirname "$0")/.."
 START=${1:-35}; SECS=${2:-90}; D=${3:-.local_data/fog_90s}
 V="test_videos/Saturday Morning Football in Heavy Fog 10am Match Highlights 7th November 2026 Eltham Goals.mp4"
 export PITCH_MASK=.local_data/fog_pitch_mask.npy COLOUR_LOCK=1 EXCLUDE_EDGE_PX=4 SAT_W=120 TEAM_LABELS="W:P,B:B" LBL_W=P LBL_B=B TEAM_SIZE=6 RETEAM=1

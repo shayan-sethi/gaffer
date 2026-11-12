@@ -23,7 +23,7 @@ from scipy.optimize import linear_sum_assignment
 from ultralytics import YOLO
 
 CLIP, GT, N, MODE, OUT = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
-MODEL = r".local_data\models\football-player-detection.pt"
+MODEL = r".local_data/models/football-player-detection.pt"
 CONF = 0.25
 IOU_MATCH = 0.3
 TILE, TILE_STEP = 1280, 1000

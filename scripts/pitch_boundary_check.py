@@ -17,9 +17,9 @@ from ultralytics import YOLO
 import sports.configs.soccer as pitch_cfg
 
 MATCH_ID = sys.argv[1]
-DB_PATH = r".local_data\gaffer_test.db"
+DB_PATH = r".local_data/gaffer_test.db"
 VIDEO_PATH = r"test_videos\Barcelona vs Espanyol 2-1 1st half Tactical Cam - CameraTattica (1080p).mp4"
-PITCH_MODEL_PATH = r".local_data\models\football-pitch-detection.pt"
+PITCH_MODEL_PATH = r".local_data/models/football-pitch-detection.pt"
 CALIB_SAMPLE_INTERVAL_FRAMES = 25  # ~once per second at 25fps
 KEYPOINT_CONF = 0.5
 MAX_FRAMES = 4500  # only the window we actually tracked - was accidentally the whole video

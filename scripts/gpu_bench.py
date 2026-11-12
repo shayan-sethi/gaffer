@@ -11,7 +11,7 @@ for _ in range(N):
     ok, f = cap.read()
     if ok: frames.append(f[380:1080])
 print(len(frames), "frames of", frames[0].shape)
-for name, w, sz in (("person (yolov8n, 2560)", "yolov8n.pt", 2560), ("ball model (1920)", r".local_data\models\football-ball-detection.pt", 1920)):
+for name, w, sz in (("person (yolov8n, 2560)", "yolov8n.pt", 2560), ("ball model (1920)", r".local_data/models/football-ball-detection.pt", 1920)):
     for dev in (["0", "cpu"] if torch.cuda.is_available() else ["cpu"]):
         m = YOLO(w)                                                              # a fresh model per device: ultralytics keeps the first device it was used on
         m(frames[0], imgsz=sz, device=dev, verbose=False)                        # warm-up
