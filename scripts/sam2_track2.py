@@ -173,7 +173,8 @@ with torch.inference_mode(), device.autocast(dev):
         def _trim(d, keep_from):
             for k_ in [k_ for k_ in d if k_ < keep_from]:
                 del d[k_]
-        _trim(st["output_dict"]["non_cond_frame_outputs"], last - 30)
+        if "output_dict" in st:                              # older SAM 2 versions keep one shared dict as well; this one only keeps one per object
+            _trim(st["output_dict"]["non_cond_frame_outputs"], last - 30)
         for od_ in st["output_dict_per_obj"].values():
             _trim(od_["non_cond_frame_outputs"], last - 30)
         if last % 50 < CH:
